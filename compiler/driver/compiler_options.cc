@@ -20,6 +20,8 @@
 
 #include "android-base/stringprintf.h"
 
+#include "arch/instruction_set.h"
+#include "arch/instruction_set_features.h"
 #include "base/runtime_debug.h"
 #include "base/variant_map.h"
 #include "cmdline_parser.h"
@@ -37,11 +39,15 @@ CompilerOptions::CompilerOptions()
       tiny_method_threshold_(kDefaultTinyMethodThreshold),
       num_dex_methods_threshold_(kDefaultNumDexMethodsThreshold),
       inline_max_code_units_(kUnsetInlineMaxCodeUnits),
-      no_inline_from_(nullptr),
+      instruction_set_(kRuntimeISA == InstructionSet::kArm ? InstructionSet::kThumb2 : kRuntimeISA),
+      instruction_set_features_(nullptr),
+      no_inline_from_(),
+      dex_files_for_oat_file_(),
+      image_classes_(),
       boot_image_(false),
       core_image_(false),
       app_image_(false),
-      top_k_profile_threshold_(kDefaultTopKProfileThreshold),
+      baseline_(false),
       debuggable_(false),
       generate_debug_info_(kDefaultGenerateDebugInfo),
       generate_mini_debug_info_(kDefaultGenerateMiniDebugInfo),
@@ -51,7 +57,10 @@ CompilerOptions::CompilerOptions()
       implicit_suspend_checks_(false),
       compile_pic_(false),
       dump_timings_(false),
+      dump_pass_timings_(false),
       dump_stats_(false),
+      top_k_profile_threshold_(kDefaultTopKProfileThreshold),
+      profile_compilation_info_(nullptr),
       verbose_methods_(),
       abort_on_hard_verifier_failure_(false),
       abort_on_soft_verifier_failure_(false),
@@ -61,13 +70,14 @@ CompilerOptions::CompilerOptions()
       force_determinism_(false),
       deduplicate_code_(true),
       count_hotness_in_compiled_code_(false),
+      resolve_startup_const_strings_(false),
       register_allocation_strategy_(RegisterAllocator::kRegisterAllocatorDefault),
       passes_to_run_(nullptr) {
 }
 
 CompilerOptions::~CompilerOptions() {
-  // The destructor looks empty but it destroys a PassManagerOptions object. We keep it here
-  // because we don't want to include the PassManagerOptions definition from the header file.
+  // Everything done by member destructors.
+  // The definitions of classes forward-declared in the header have now been #included.
 }
 
 namespace {
@@ -109,9 +119,6 @@ bool CompilerOptions::ParseRegisterAllocationStrategy(const std::string& option,
   return true;
 }
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wframe-larger-than="
-
 bool CompilerOptions::ParseCompilerOptions(const std::vector<std::string>& options,
                                            bool ignore_unrecognized,
                                            std::string* error_msg) {
@@ -126,6 +133,11 @@ bool CompilerOptions::ParseCompilerOptions(const std::vector<std::string>& optio
   return ReadCompilerOptions(args, this, error_msg);
 }
 
-#pragma GCC diagnostic pop
+bool CompilerOptions::IsImageClass(const char* descriptor) const {
+  // Historical note: We used to hold the set indirectly and there was a distinction between an
+  // empty set and a null, null meaning to include all classes. However, the distiction has been
+  // removed; if we don't have a profile, we treat it as an empty set of classes. b/77340429
+  return image_classes_.find(StringPiece(descriptor)) != image_classes_.end();
+}
 
 }  // namespace art

@@ -27,8 +27,8 @@
 #include "base/iteration_range.h"
 #include "base/macros.h"
 #include "base/value_object.h"
+#include "class_iterator.h"
 #include "dex_file_types.h"
-#include "dex_instruction_iterator.h"
 #include "hidden_api_access_flags.h"
 #include "jni.h"
 #include "modifiers.h"
@@ -37,6 +37,7 @@ namespace art {
 
 class ClassDataItemIterator;
 class CompactDexFile;
+class DexInstructionIterator;
 enum InvokeType : uint32_t;
 class MemMap;
 class OatDexFile;
@@ -79,6 +80,7 @@ class DexFile {
 
   // The value of an invalid index.
   static const uint16_t kDexNoIndex16 = 0xFFFF;
+  static const uint32_t kDexNoIndex32 = 0xFFFFFFFF;
 
   // Raw header_item.
   struct Header {
@@ -90,7 +92,7 @@ class DexFile {
     uint32_t endian_tag_ = 0;
     uint32_t link_size_ = 0;  // unused
     uint32_t link_off_ = 0;  // unused
-    uint32_t map_off_ = 0;  // unused
+    uint32_t map_off_ = 0;  // map list offset from data_off_
     uint32_t string_ids_size_ = 0;  // number of StringIds
     uint32_t string_ids_off_ = 0;  // file offset of StringIds array
     uint32_t type_ids_size_ = 0;  // number of TypeIds, we don't support more than 65535
@@ -132,6 +134,7 @@ class DexFile {
     kDexTypeAnnotationItem           = 0x2004,
     kDexTypeEncodedArrayItem         = 0x2005,
     kDexTypeAnnotationsDirectoryItem = 0x2006,
+    kDexTypeHiddenapiClassData       = 0xF000,
   };
 
   struct MapItem {
@@ -144,6 +147,8 @@ class DexFile {
   struct MapList {
     uint32_t size_;
     MapItem list_[1];
+
+    size_t Size() const { return sizeof(uint32_t) + (size_ * sizeof(MapItem)); }
 
    private:
     DISALLOW_COPY_AND_ASSIGN(MapList);
@@ -189,7 +194,7 @@ class DexFile {
   // Raw method_id_item.
   struct MethodId {
     dex::TypeIndex class_idx_;   // index into type_ids_ array for defining class
-    uint16_t proto_idx_;         // index into proto_ids_ array for method prototype
+    dex::ProtoIndex proto_idx_;  // index into proto_ids_ array for method prototype
     dex::StringIndex name_idx_;  // index into string_ids_ array for method name
 
    private:
@@ -235,9 +240,6 @@ class DexFile {
         return access_flags_ & kAccValidClassFlags;
       }
     }
-
-    template <typename Visitor>
-    void VisitMethods(const DexFile* dex_file, const Visitor& visitor) const;
 
    private:
     DISALLOW_COPY_AND_ASSIGN(ClassDef);
@@ -420,6 +422,27 @@ class DexFile {
     DISALLOW_COPY_AND_ASSIGN(AnnotationItem);
   };
 
+  struct HiddenapiClassData {
+    uint32_t size_;             // total size of the item
+    uint32_t flags_offset_[1];  // array of offsets from the beginning of this item,
+                                // indexed by class def index
+
+    // Returns a pointer to the beginning of a uleb128-stream of hiddenapi
+    // flags for a class def of given index. Values are in the same order
+    // as fields/methods in the class data. Returns null if the class does
+    // not have class data.
+    const uint8_t* GetFlagsPointer(uint32_t class_def_idx) const {
+      if (flags_offset_[class_def_idx] == 0) {
+        return nullptr;
+      } else {
+        return reinterpret_cast<const uint8_t*>(this) + flags_offset_[class_def_idx];
+      }
+    }
+
+   private:
+    DISALLOW_COPY_AND_ASSIGN(HiddenapiClassData);
+  };
+
   enum AnnotationResultStyle {  // private
     kAllObjects,
     kPrimitivesOrObjects,
@@ -503,9 +526,6 @@ class DexFile {
   const StringId* FindStringId(const char* string) const;
 
   const TypeId* FindTypeId(const char* string) const;
-
-  // Looks up a string id for a given utf16 string.
-  const StringId* FindStringId(const uint16_t* string, size_t length) const;
 
   // Returns the number of type identifiers in the .dex file.
   uint32_t NumTypeIds() const {
@@ -621,6 +641,8 @@ class DexFile {
 
   // Returns the name of a method id.
   const char* GetMethodName(const MethodId& method_id) const;
+  const char* GetMethodName(const MethodId& method_id, uint32_t* utf_length) const;
+  const char* GetMethodName(uint32_t idx, uint32_t* utf_length) const;
 
   // Returns the shorty of a method by its index.
   const char* GetMethodShorty(uint32_t idx) const;
@@ -695,15 +717,15 @@ class DexFile {
   }
 
   // Returns the ProtoId at the specified index.
-  const ProtoId& GetProtoId(uint16_t idx) const {
-    DCHECK_LT(idx, NumProtoIds()) << GetLocation();
-    return proto_ids_[idx];
+  const ProtoId& GetProtoId(dex::ProtoIndex idx) const {
+    DCHECK_LT(idx.index_, NumProtoIds()) << GetLocation();
+    return proto_ids_[idx.index_];
   }
 
-  uint16_t GetIndexForProtoId(const ProtoId& proto_id) const {
+  dex::ProtoIndex GetIndexForProtoId(const ProtoId& proto_id) const {
     CHECK_GE(&proto_id, proto_ids_) << GetLocation();
     CHECK_LT(&proto_id, proto_ids_ + header_->proto_ids_size_) << GetLocation();
-    return &proto_id - proto_ids_;
+    return dex::ProtoIndex(&proto_id - proto_ids_);
   }
 
   // Looks up a proto id for a given return type and signature type list
@@ -725,7 +747,7 @@ class DexFile {
   const Signature CreateSignature(const StringPiece& signature) const;
 
   // Returns the short form method descriptor for the given prototype.
-  const char* GetShorty(uint32_t proto_idx) const;
+  const char* GetShorty(dex::ProtoIndex proto_idx) const;
 
   const TypeList* GetProtoParameters(const ProtoId& proto_id) const {
     return DataPointer<TypeList>(proto_id.parameters_off_);
@@ -738,6 +760,8 @@ class DexFile {
   const uint8_t* GetCallSiteEncodedValuesArray(const CallSiteIdItem& call_site_id) const {
     return DataBegin() + call_site_id.data_off_;
   }
+
+  dex::ProtoIndex GetProtoIndexForCallSite(uint32_t call_site_idx) const;
 
   static const TryItem* GetTryItems(const DexInstructionIterator& code_item_end, uint32_t offset);
 
@@ -783,8 +807,6 @@ class DexFile {
 
   // Callback for "new locals table entry".
   typedef void (*DexDebugNewLocalCb)(void* context, const LocalInfo& entry);
-
-  static bool LineNumForPcCb(void* context, const PositionInfo& entry);
 
   const AnnotationsDirectoryItem* GetAnnotationsDirectory(const ClassDef& class_def) const {
     return DataPointer<AnnotationsDirectoryItem>(class_def.annotations_off_);
@@ -841,6 +863,14 @@ class DexFile {
     return DataPointer<AnnotationItem>(offset);
   }
 
+  ALWAYS_INLINE const HiddenapiClassData* GetHiddenapiClassDataAtOffset(uint32_t offset) const {
+    return DataPointer<HiddenapiClassData>(offset);
+  }
+
+  ALWAYS_INLINE const HiddenapiClassData* GetHiddenapiClassData() const {
+    return hiddenapi_class_data_;
+  }
+
   const AnnotationItem* GetAnnotationItem(const AnnotationSetItem* set_item, uint32_t index) const {
     DCHECK_LE(index, set_item->size_);
     return GetAnnotationItemAtOffset(set_item->entries_[index]);
@@ -867,15 +897,6 @@ class DexFile {
     DBG_LINE_RANGE           = 15,
   };
 
-  struct LineNumFromPcContext {
-    LineNumFromPcContext(uint32_t address, uint32_t line_num)
-        : address_(address), line_num_(line_num) {}
-    uint32_t address_;
-    uint32_t line_num_;
-   private:
-    DISALLOW_COPY_AND_ASSIGN(LineNumFromPcContext);
-  };
-
   // Returns false if there is no debugging information or if it cannot be decoded.
   template<typename NewLocalCallback, typename IndexToStringData, typename TypeIndexToStringData>
   static bool DecodeDebugLocalInfo(const uint8_t* stream,
@@ -887,10 +908,9 @@ class DexFile {
                                    uint16_t registers_size,
                                    uint16_t ins_size,
                                    uint16_t insns_size_in_code_units,
-                                   IndexToStringData index_to_string_data,
-                                   TypeIndexToStringData type_index_to_string_data,
-                                   NewLocalCallback new_local,
-                                   void* context);
+                                   const IndexToStringData& index_to_string_data,
+                                   const TypeIndexToStringData& type_index_to_string_data,
+                                   const NewLocalCallback& new_local) NO_THREAD_SAFETY_ANALYSIS;
   template<typename NewLocalCallback>
   bool DecodeDebugLocalInfo(uint32_t registers_size,
                             uint32_t ins_size,
@@ -898,19 +918,13 @@ class DexFile {
                             uint32_t debug_info_offset,
                             bool is_static,
                             uint32_t method_idx,
-                            NewLocalCallback new_local,
-                            void* context) const;
+                            const NewLocalCallback& new_local) const;
 
   // Returns false if there is no debugging information or if it cannot be decoded.
   template<typename DexDebugNewPosition, typename IndexToStringData>
   static bool DecodeDebugPositionInfo(const uint8_t* stream,
-                                      IndexToStringData index_to_string_data,
-                                      DexDebugNewPosition position_functor,
-                                      void* context);
-  template<typename DexDebugNewPosition>
-  bool DecodeDebugPositionInfo(uint32_t debug_info_offset,
-                               DexDebugNewPosition position_functor,
-                               void* context) const;
+                                      const IndexToStringData& index_to_string_data,
+                                      const DexDebugNewPosition& position_functor);
 
   const char* GetSourceFile(const ClassDef& class_def) const {
     if (!class_def.source_file_idx_.IsValid()) {
@@ -1012,8 +1026,11 @@ class DexFile {
     return container_.get();
   }
 
-  // Changes the dex file pointed to by class_it to not have any hiddenapi flags.
-  static void UnHideAccessFlags(ClassDataItemIterator& class_it);
+  IterationRange<ClassIterator> GetClasses() const;
+
+  template <typename Visitor>
+  static uint32_t DecodeDebugInfoParameterNames(const uint8_t** debug_info,
+                                                const Visitor& visitor);
 
  protected:
   // First Dex format version supporting default methods.
@@ -1090,6 +1107,10 @@ class DexFile {
 
   // Number of elements in the call sites list.
   size_t num_call_site_ids_;
+
+  // Points to the base of the hiddenapi class data item_, or nullptr if the dex
+  // file does not have one.
+  const HiddenapiClassData* hiddenapi_class_data_;
 
   // If this dex file was loaded from an oat file, oat_dex_file_ contains a
   // pointer to the OatDexFile it was loaded from. Otherwise oat_dex_file_ is
@@ -1170,215 +1191,6 @@ class Signature : public ValueObject {
   const DexFile::ProtoId* const proto_id_ = nullptr;
 };
 std::ostream& operator<<(std::ostream& os, const Signature& sig);
-
-// Iterate and decode class_data_item
-class ClassDataItemIterator {
- public:
-  ClassDataItemIterator(const DexFile& dex_file, const uint8_t* raw_class_data_item)
-      : dex_file_(dex_file), pos_(0), ptr_pos_(raw_class_data_item), last_idx_(0) {
-    ReadClassDataHeader();
-    if (EndOfInstanceFieldsPos() > 0) {
-      ReadClassDataField();
-    } else if (EndOfVirtualMethodsPos() > 0) {
-      ReadClassDataMethod();
-    }
-  }
-  uint32_t NumStaticFields() const {
-    return header_.static_fields_size_;
-  }
-  uint32_t NumInstanceFields() const {
-    return header_.instance_fields_size_;
-  }
-  uint32_t NumDirectMethods() const {
-    return header_.direct_methods_size_;
-  }
-  uint32_t NumVirtualMethods() const {
-    return header_.virtual_methods_size_;
-  }
-  bool IsAtMethod() const {
-    return pos_ >= EndOfInstanceFieldsPos();
-  }
-  bool HasNextStaticField() const {
-    return pos_ < EndOfStaticFieldsPos();
-  }
-  bool HasNextInstanceField() const {
-    return pos_ >= EndOfStaticFieldsPos() && pos_ < EndOfInstanceFieldsPos();
-  }
-  bool HasNextDirectMethod() const {
-    return pos_ >= EndOfInstanceFieldsPos() && pos_ < EndOfDirectMethodsPos();
-  }
-  bool HasNextVirtualMethod() const {
-    return pos_ >= EndOfDirectMethodsPos() && pos_ < EndOfVirtualMethodsPos();
-  }
-  bool HasNextMethod() const {
-    const bool result = pos_ >= EndOfInstanceFieldsPos() && pos_ < EndOfVirtualMethodsPos();
-    DCHECK_EQ(result, HasNextDirectMethod() || HasNextVirtualMethod());
-    return result;
-  }
-  void SkipStaticFields() {
-    while (HasNextStaticField()) {
-      Next();
-    }
-  }
-  void SkipInstanceFields() {
-    while (HasNextInstanceField()) {
-      Next();
-    }
-  }
-  void SkipAllFields() {
-    SkipStaticFields();
-    SkipInstanceFields();
-  }
-  void SkipDirectMethods() {
-    while (HasNextDirectMethod()) {
-      Next();
-    }
-  }
-  void SkipVirtualMethods() {
-    while (HasNextVirtualMethod()) {
-      Next();
-    }
-  }
-  bool HasNext() const {
-    return pos_ < EndOfVirtualMethodsPos();
-  }
-  inline void Next() {
-    pos_++;
-    if (pos_ < EndOfStaticFieldsPos()) {
-      last_idx_ = GetMemberIndex();
-      ReadClassDataField();
-    } else if (pos_ == EndOfStaticFieldsPos() && NumInstanceFields() > 0) {
-      last_idx_ = 0;  // transition to next array, reset last index
-      ReadClassDataField();
-    } else if (pos_ < EndOfInstanceFieldsPos()) {
-      last_idx_ = GetMemberIndex();
-      ReadClassDataField();
-    } else if (pos_ == EndOfInstanceFieldsPos() && NumDirectMethods() > 0) {
-      last_idx_ = 0;  // transition to next array, reset last index
-      ReadClassDataMethod();
-    } else if (pos_ < EndOfDirectMethodsPos()) {
-      last_idx_ = GetMemberIndex();
-      ReadClassDataMethod();
-    } else if (pos_ == EndOfDirectMethodsPos() && NumVirtualMethods() > 0) {
-      last_idx_ = 0;  // transition to next array, reset last index
-      ReadClassDataMethod();
-    } else if (pos_ < EndOfVirtualMethodsPos()) {
-      last_idx_ = GetMemberIndex();
-      ReadClassDataMethod();
-    } else {
-      DCHECK(!HasNext());
-    }
-  }
-  uint32_t GetMemberIndex() const {
-    if (pos_ < EndOfInstanceFieldsPos()) {
-      return last_idx_ + field_.field_idx_delta_;
-    } else {
-      DCHECK_LT(pos_, EndOfVirtualMethodsPos());
-      return last_idx_ + method_.method_idx_delta_;
-    }
-  }
-  uint32_t GetRawMemberAccessFlags() const {
-    if (pos_ < EndOfInstanceFieldsPos()) {
-      return field_.access_flags_;
-    } else {
-      DCHECK_LT(pos_, EndOfVirtualMethodsPos());
-      return method_.access_flags_;
-    }
-  }
-  uint32_t GetFieldAccessFlags() const {
-    return GetMemberAccessFlags() & kAccValidFieldFlags;
-  }
-  uint32_t GetMethodAccessFlags() const {
-    return GetMemberAccessFlags() & kAccValidMethodFlags;
-  }
-  uint32_t GetMemberAccessFlags() const {
-    return HiddenApiAccessFlags::RemoveFromDex(GetRawMemberAccessFlags());
-  }
-  HiddenApiAccessFlags::ApiList DecodeHiddenAccessFlags() const {
-    return HiddenApiAccessFlags::DecodeFromDex(GetRawMemberAccessFlags());
-  }
-  bool MemberIsNative() const {
-    return GetRawMemberAccessFlags() & kAccNative;
-  }
-  bool MemberIsFinal() const {
-    return GetRawMemberAccessFlags() & kAccFinal;
-  }
-  ALWAYS_INLINE InvokeType GetMethodInvokeType(const DexFile::ClassDef& class_def) const;
-  const DexFile::CodeItem* GetMethodCodeItem() const {
-    return dex_file_.GetCodeItem(method_.code_off_);
-  }
-  uint32_t GetMethodCodeItemOffset() const {
-    return method_.code_off_;
-  }
-  const uint8_t* DataPointer() const {
-    return ptr_pos_;
-  }
-  const uint8_t* EndDataPointer() const {
-    CHECK(!HasNext());
-    return ptr_pos_;
-  }
-
- private:
-  // A dex file's class_data_item is leb128 encoded, this structure holds a decoded form of the
-  // header for a class_data_item
-  struct ClassDataHeader {
-    uint32_t static_fields_size_;  // the number of static fields
-    uint32_t instance_fields_size_;  // the number of instance fields
-    uint32_t direct_methods_size_;  // the number of direct methods
-    uint32_t virtual_methods_size_;  // the number of virtual methods
-  } header_;
-
-  // Read and decode header from a class_data_item stream into header
-  void ReadClassDataHeader();
-
-  uint32_t EndOfStaticFieldsPos() const {
-    return header_.static_fields_size_;
-  }
-  uint32_t EndOfInstanceFieldsPos() const {
-    return EndOfStaticFieldsPos() + header_.instance_fields_size_;
-  }
-  uint32_t EndOfDirectMethodsPos() const {
-    return EndOfInstanceFieldsPos() + header_.direct_methods_size_;
-  }
-  uint32_t EndOfVirtualMethodsPos() const {
-    return EndOfDirectMethodsPos() + header_.virtual_methods_size_;
-  }
-
-  // A decoded version of the field of a class_data_item
-  struct ClassDataField {
-    uint32_t field_idx_delta_;  // delta of index into the field_ids array for FieldId
-    uint32_t access_flags_;  // access flags for the field
-    ClassDataField() :  field_idx_delta_(0), access_flags_(0) {}
-
-   private:
-    DISALLOW_COPY_AND_ASSIGN(ClassDataField);
-  };
-  ClassDataField field_;
-
-  // Read and decode a field from a class_data_item stream into field
-  void ReadClassDataField();
-
-  // A decoded version of the method of a class_data_item
-  struct ClassDataMethod {
-    uint32_t method_idx_delta_;  // delta of index into the method_ids array for MethodId
-    uint32_t access_flags_;
-    uint32_t code_off_;
-    ClassDataMethod() : method_idx_delta_(0), access_flags_(0), code_off_(0) {}
-
-   private:
-    DISALLOW_COPY_AND_ASSIGN(ClassDataMethod);
-  };
-  ClassDataMethod method_;
-
-  // Read and decode a method from a class_data_item stream into method
-  void ReadClassDataMethod();
-
-  const DexFile& dex_file_;
-  size_t pos_;  // integral number of items passed
-  const uint8_t* ptr_pos_;  // pointer into stream of class_data_item
-  uint32_t last_idx_;  // last read field or method index to apply delta to
-  DISALLOW_IMPLICIT_CONSTRUCTORS(ClassDataItemIterator);
-};
 
 class EncodedArrayValueIterator {
  public:

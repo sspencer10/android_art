@@ -100,7 +100,7 @@ class SchedulingLatencyVisitorARM : public SchedulingLatencyVisitor {
   M(DataProcWithShifterOp, unused)
 
 #define DECLARE_VISIT_INSTRUCTION(type, unused)  \
-  void Visit##type(H##type* instruction) OVERRIDE;
+  void Visit##type(H##type* instruction) override;
 
   FOR_EACH_SCHEDULED_ARM_INSTRUCTION(DECLARE_VISIT_INSTRUCTION)
   FOR_EACH_SCHEDULED_SHARED_INSTRUCTION(DECLARE_VISIT_INSTRUCTION)
@@ -137,13 +137,12 @@ class SchedulingLatencyVisitorARM : public SchedulingLatencyVisitor {
 
 class HSchedulerARM : public HScheduler {
  public:
-  HSchedulerARM(ScopedArenaAllocator* allocator,
-                SchedulingNodeSelector* selector,
+  HSchedulerARM(SchedulingNodeSelector* selector,
                 SchedulingLatencyVisitorARM* arm_latency_visitor)
-      : HScheduler(allocator, arm_latency_visitor, selector) {}
-  ~HSchedulerARM() OVERRIDE {}
+      : HScheduler(arm_latency_visitor, selector) {}
+  ~HSchedulerARM() override {}
 
-  bool IsSchedulable(const HInstruction* instruction) const OVERRIDE {
+  bool IsSchedulable(const HInstruction* instruction) const override {
 #define CASE_INSTRUCTION_KIND(type, unused) case \
   HInstruction::InstructionKind::k##type:
     switch (instruction->GetKind()) {

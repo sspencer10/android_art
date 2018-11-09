@@ -29,6 +29,7 @@
 
 #include "arch/instruction_set.h"
 #include "base/macros.h"
+#include "base/mem_map.h"
 #include "base/mutex.h"
 #include "deoptimization_kind.h"
 #include "dex/dex_file_types.h"
@@ -55,6 +56,7 @@ enum class EnforcementPolicy;
 
 namespace jit {
 class Jit;
+class JitCodeCache;
 class JitOptions;
 }  // namespace jit
 
@@ -86,7 +88,6 @@ class InternTable;
 class IsMarkedVisitor;
 class JavaVMExt;
 class LinearAlloc;
-class MemMap;
 class MonitorList;
 class MonitorPool;
 class NullPointerHandler;
@@ -142,10 +143,6 @@ class Runtime {
     return must_relocate_;
   }
 
-  bool IsDex2OatEnabled() const {
-    return dex2oat_enabled_ && IsImageDex2OatEnabled();
-  }
-
   bool IsImageDex2OatEnabled() const {
     return image_dex2oat_enabled_;
   }
@@ -168,7 +165,6 @@ class Runtime {
   }
 
   std::string GetCompilerExecutable() const;
-  std::string GetPatchoatExecutable() const;
 
   const std::vector<std::string>& GetCompilerOptions() const {
     return compiler_options_;
@@ -211,6 +207,8 @@ class Runtime {
   bool IsFinishedStarting() const {
     return finished_starting_;
   }
+
+  void RunRootClinits(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_);
 
   static Runtime* Current() {
     return instance_;
@@ -291,7 +289,12 @@ class Runtime {
   // Get the special object used to mark a cleared JNI weak global.
   mirror::Object* GetClearedJniWeakGlobal() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  mirror::Throwable* GetPreAllocatedOutOfMemoryError() REQUIRES_SHARED(Locks::mutator_lock_);
+  mirror::Throwable* GetPreAllocatedOutOfMemoryErrorWhenThrowingException()
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  mirror::Throwable* GetPreAllocatedOutOfMemoryErrorWhenThrowingOOME()
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  mirror::Throwable* GetPreAllocatedOutOfMemoryErrorWhenHandlingStackOverflow()
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   mirror::Throwable* GetPreAllocatedNoClassDefFoundError()
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -394,14 +397,10 @@ class Runtime {
   ArtMethod* GetCalleeSaveMethodUnchecked(CalleeSaveType type)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  QuickMethodFrameInfo GetCalleeSaveMethodFrameInfo(CalleeSaveType type) const {
-    return callee_save_method_frame_infos_[static_cast<size_t>(type)];
-  }
-
   QuickMethodFrameInfo GetRuntimeMethodFrameInfo(ArtMethod* method)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  static size_t GetCalleeSaveMethodOffset(CalleeSaveType type) {
+  static constexpr size_t GetCalleeSaveMethodOffset(CalleeSaveType type) {
     return OFFSETOF_MEMBER(Runtime, callee_save_methods_[static_cast<size_t>(type)]);
   }
 
@@ -616,6 +615,8 @@ class Runtime {
     return (experimental_flags_ & flags) != ExperimentalFlags::kNone;
   }
 
+  void CreateJitCodeCache(bool rwx_memory_allowed);
+
   // Create the JIT and instrumentation and code cache.
   void CreateJit();
 
@@ -656,13 +657,32 @@ class Runtime {
     is_native_debuggable_ = value;
   }
 
+  bool AreNonStandardExitsEnabled() const {
+    return non_standard_exits_enabled_;
+  }
+
+  void SetNonStandardExitsEnabled() {
+    DoAndMaybeSwitchInterpreter([=](){ non_standard_exits_enabled_ = true; });
+  }
+
   bool AreAsyncExceptionsThrown() const {
     return async_exceptions_thrown_;
   }
 
   void SetAsyncExceptionsThrown() {
-    async_exceptions_thrown_ = true;
+    DoAndMaybeSwitchInterpreter([=](){ async_exceptions_thrown_ = true; });
   }
+
+  // Change state and re-check which interpreter should be used.
+  //
+  // This must be called whenever there is an event that forces
+  // us to use different interpreter (e.g. debugger is attached).
+  //
+  // Changing the state using the lamda gives us some multihreading safety.
+  // It ensures that two calls do not interfere with each other and
+  // it makes it possible to DCHECK that thread local flag is correct.
+  template<typename Action>
+  static void DoAndMaybeSwitchInterpreter(Action lamda);
 
   // Returns the build fingerprint, if set. Otherwise an empty string is returned.
   std::string GetFingerprint() {
@@ -671,6 +691,9 @@ class Runtime {
 
   // Called from class linker.
   void SetSentinel(mirror::Object* sentinel) REQUIRES_SHARED(Locks::mutator_lock_);
+  // For testing purpose only.
+  // TODO: Remove this when this is no longer needed (b/116087961).
+  GcRoot<mirror::Object> GetSentinel() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Create a normal LinearAlloc or low 4gb version if we are 64 bit AOT compiler.
   LinearAlloc* CreateLinearAlloc();
@@ -776,6 +799,10 @@ class Runtime {
 
   static constexpr int32_t kUnsetSdkVersion = 0u;
 
+  uint32_t GetVerifierLoggingThresholdMs() const {
+    return verifier_logging_threshold_ms_;
+  }
+
  private:
   static void InitPlatformSignalHandlers();
 
@@ -817,7 +844,10 @@ class Runtime {
 
   // 64 bit so that we can share the same asm offsets for both 32 and 64 bits.
   uint64_t callee_save_methods_[kCalleeSaveSize];
-  GcRoot<mirror::Throwable> pre_allocated_OutOfMemoryError_;
+  // Pre-allocated exceptions (see Runtime::Init).
+  GcRoot<mirror::Throwable> pre_allocated_OutOfMemoryError_when_throwing_exception_;
+  GcRoot<mirror::Throwable> pre_allocated_OutOfMemoryError_when_throwing_oome_;
+  GcRoot<mirror::Throwable> pre_allocated_OutOfMemoryError_when_handling_stack_overflow_;
   GcRoot<mirror::Throwable> pre_allocated_NoClassDefFoundError_;
   ArtMethod* resolution_method_;
   ArtMethod* imt_conflict_method_;
@@ -830,18 +860,15 @@ class Runtime {
   GcRoot<mirror::Object> sentinel_;
 
   InstructionSet instruction_set_;
-  QuickMethodFrameInfo callee_save_method_frame_infos_[kCalleeSaveSize];
 
   CompilerCallbacks* compiler_callbacks_;
   bool is_zygote_;
   bool must_relocate_;
   bool is_concurrent_gc_enabled_;
   bool is_explicit_gc_disabled_;
-  bool dex2oat_enabled_;
   bool image_dex2oat_enabled_;
 
   std::string compiler_executable_;
-  std::string patchoat_executable_;
   std::vector<std::string> compiler_options_;
   std::vector<std::string> image_compiler_options_;
   std::string image_location_;
@@ -882,17 +909,10 @@ class Runtime {
 
   SignalCatcher* signal_catcher_;
 
-  // If true, the runtime will connect to tombstoned via a socket to
-  // request an open file descriptor to write its traces to.
-  bool use_tombstoned_traces_;
-
-  // Location to which traces must be written on SIGQUIT. Only used if
-  // tombstoned_traces_ == false.
-  std::string stack_trace_file_;
-
   std::unique_ptr<JavaVMExt> java_vm_;
 
   std::unique_ptr<jit::Jit> jit_;
+  std::unique_ptr<jit::JitCodeCache> jit_code_cache_;
   std::unique_ptr<jit::JitOptions> jit_options_;
 
   // Fault message, printed when we get a SIGSEGV.
@@ -967,7 +987,7 @@ class Runtime {
   bool implicit_suspend_checks_;    // Thread suspension checks are implicit.
 
   // Whether or not the sig chain (and implicitly the fault handler) should be
-  // disabled. Tools like dex2oat or patchoat don't need them. This enables
+  // disabled. Tools like dex2oat don't need them. This enables
   // building a statically link version of dex2oat.
   bool no_sig_chain_;
 
@@ -991,6 +1011,10 @@ class Runtime {
   // whether or not any async exceptions have ever been thrown. This is used to speed up the
   // MterpShouldSwitchInterpreters function.
   bool async_exceptions_thrown_;
+
+  // Whether anything is going to be using the shadow-frame APIs to force a function to return
+  // early. Doing this requires that (1) we be debuggable and (2) that mterp is exited.
+  bool non_standard_exits_enabled_;
 
   // Whether Java code needs to be debuggable.
   bool is_java_debuggable_;
@@ -1089,7 +1113,9 @@ class Runtime {
   std::atomic<uint32_t> deoptimization_counts_[
       static_cast<uint32_t>(DeoptimizationKind::kLast) + 1];
 
-  std::unique_ptr<MemMap> protected_fault_page_;
+  MemMap protected_fault_page_;
+
+  uint32_t verifier_logging_threshold_ms_;
 
   DISALLOW_COPY_AND_ASSIGN(Runtime);
 };

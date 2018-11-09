@@ -27,6 +27,7 @@
 #include "allocator_type.h"
 #include "arch/instruction_set.h"
 #include "base/atomic.h"
+#include "base/globals.h"
 #include "base/macros.h"
 #include "base/mutex.h"
 #include "base/runtime_debug.h"
@@ -37,7 +38,6 @@
 #include "gc/collector_type.h"
 #include "gc/gc_cause.h"
 #include "gc/space/large_object_space.h"
-#include "globals.h"
 #include "handle.h"
 #include "obj_ptr.h"
 #include "offsets.h"
@@ -84,7 +84,6 @@ class RememberedSet;
 namespace collector {
 class ConcurrentCopying;
 class GarbageCollector;
-class MarkCompact;
 class MarkSweep;
 class SemiSpace;
 }  // namespace collector
@@ -467,23 +466,6 @@ class Heap {
   // Record the bytes freed by thread-local buffer revoke.
   void RecordFreeRevoke();
 
-  // Must be called if a field of an Object in the heap changes, and before any GC safe-point.
-  // The call is not needed if null is stored in the field.
-  ALWAYS_INLINE void WriteBarrierField(ObjPtr<mirror::Object> dst,
-                                       MemberOffset offset,
-                                       ObjPtr<mirror::Object> new_value)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Write barrier for array operations that update many field positions
-  ALWAYS_INLINE void WriteBarrierArray(ObjPtr<mirror::Object> dst,
-                                       int start_offset,
-                                       // TODO: element_count or byte_count?
-                                       size_t length)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  ALWAYS_INLINE void WriteBarrierEveryFieldOf(ObjPtr<mirror::Object> obj)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
   accounting::CardTable* GetCardTable() const {
     return card_table_.get();
   }
@@ -495,8 +477,9 @@ class Heap {
   void AddFinalizerReference(Thread* self, ObjPtr<mirror::Object>* object);
 
   // Returns the number of bytes currently allocated.
+  // The result should be treated as an approximation, if it is being concurrently updated.
   size_t GetBytesAllocated() const {
-    return num_bytes_allocated_.LoadSequentiallyConsistent();
+    return num_bytes_allocated_.load(std::memory_order_relaxed);
   }
 
   // Returns the number of objects currently allocated.
@@ -524,7 +507,7 @@ class Heap {
   // were specified. Android apps start with a growth limit (small heap size) which is
   // cleared/extended for large apps.
   size_t GetMaxMemory() const {
-    // There is some race conditions in the allocation code that can cause bytes allocated to
+    // There are some race conditions in the allocation code that can cause bytes allocated to
     // become larger than growth_limit_ in rare cases.
     return std::max(GetBytesAllocated(), growth_limit_);
   }
@@ -546,7 +529,7 @@ class Heap {
   // Returns how much free memory we have until we need to grow the heap to perform an allocation.
   // Similar to GetFreeMemoryUntilGC. Implements java.lang.Runtime.freeMemory.
   size_t GetFreeMemory() const {
-    size_t byte_allocated = num_bytes_allocated_.LoadSequentiallyConsistent();
+    size_t byte_allocated = num_bytes_allocated_.load(std::memory_order_relaxed);
     size_t total_memory = GetTotalMemory();
     // Make sure we don't get a negative number.
     return total_memory - std::min(total_memory, byte_allocated);
@@ -569,6 +552,9 @@ class Heap {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   space::Space* FindSpaceFromAddress(const void* ptr) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  std::string DumpSpaceNameFromAddress(const void* addr) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   void DumpForSigQuit(std::ostream& os) REQUIRES(!*gc_complete_lock_);
@@ -727,8 +713,15 @@ class Heap {
     return zygote_space_ != nullptr;
   }
 
+  // Returns the active concurrent copying collector.
   collector::ConcurrentCopying* ConcurrentCopyingCollector() {
-    return concurrent_copying_collector_;
+    if (kEnableGenerationalConcurrentCopyingCollection) {
+      DCHECK((active_concurrent_copying_collector_ == concurrent_copying_collector_) ||
+             (active_concurrent_copying_collector_ == young_concurrent_copying_collector_));
+    } else {
+      DCHECK_EQ(active_concurrent_copying_collector_, concurrent_copying_collector_);
+    }
+    return active_concurrent_copying_collector_;
   }
 
   CollectorType CurrentCollectorType() {
@@ -775,11 +768,11 @@ class Heap {
   // Allocation tracking support
   // Callers to this function use double-checked locking to ensure safety on allocation_records_
   bool IsAllocTrackingEnabled() const {
-    return alloc_tracking_enabled_.LoadRelaxed();
+    return alloc_tracking_enabled_.load(std::memory_order_relaxed);
   }
 
   void SetAllocTrackingEnabled(bool enabled) REQUIRES(Locks::alloc_tracker_lock_) {
-    alloc_tracking_enabled_.StoreRelaxed(enabled);
+    alloc_tracking_enabled_.store(enabled, std::memory_order_relaxed);
   }
 
   AllocRecordObjectMap* GetAllocationRecords() const
@@ -825,7 +818,7 @@ class Heap {
   void SetGcPauseListener(GcPauseListener* l);
   // Get the currently installed gc pause listener, or null.
   GcPauseListener* GetGcPauseListener() {
-    return gc_pause_listener_.LoadAcquire();
+    return gc_pause_listener_.load(std::memory_order_acquire);
   }
   // Remove a gc pause listener. Note: the listener must not be deleted, as for performance
   // reasons, we assume it stays valid when we read it (so that we don't require a lock).
@@ -833,10 +826,13 @@ class Heap {
 
   const Verification* GetVerification() const;
 
+  void PostForkChildAction(Thread* self);
+
  private:
   class ConcurrentGCTask;
   class CollectorTransitionTask;
   class HeapTrimTask;
+  class TriggerPostForkCCGcTask;
 
   // Compact source space to target space. Returns the collector used.
   collector::GarbageCollector* Compact(space::ContinuousMemMapAllocSpace* target_space,
@@ -850,8 +846,10 @@ class Heap {
   void FinishGC(Thread* self, collector::GcType gc_type) REQUIRES(!*gc_complete_lock_);
 
   // Create a mem map with a preferred base address.
-  static MemMap* MapAnonymousPreferredAddress(const char* name, uint8_t* request_begin,
-                                              size_t capacity, std::string* out_error_str);
+  static MemMap MapAnonymousPreferredAddress(const char* name,
+                                             uint8_t* request_begin,
+                                             size_t capacity,
+                                             std::string* out_error_str);
 
   bool SupportHSpaceCompaction() const {
     // Returns true if we can do hspace compaction
@@ -880,7 +878,6 @@ class Heap {
         collector_type == kCollectorTypeGSS ||
         collector_type == kCollectorTypeCC ||
         collector_type == kCollectorTypeCCBackground ||
-        collector_type == kCollectorTypeMC ||
         collector_type == kCollectorTypeHomogeneousSpaceCompact;
   }
   bool ShouldAllocLargeObject(ObjPtr<mirror::Class> c, size_t byte_count) const
@@ -995,13 +992,13 @@ class Heap {
   collector::GarbageCollector* FindCollectorByGcType(collector::GcType gc_type);
 
   // Create the main free list malloc space, either a RosAlloc space or DlMalloc space.
-  void CreateMainMallocSpace(MemMap* mem_map,
+  void CreateMainMallocSpace(MemMap&& mem_map,
                              size_t initial_size,
                              size_t growth_limit,
                              size_t capacity);
 
   // Create a malloc space based on a mem map. Does not set the space as default.
-  space::MallocSpace* CreateMallocSpaceFromMemMap(MemMap* mem_map,
+  space::MallocSpace* CreateMallocSpaceFromMemMap(MemMap&& mem_map,
                                                   size_t initial_size,
                                                   size_t growth_limit,
                                                   size_t capacity,
@@ -1087,6 +1084,8 @@ class Heap {
     // the current number of registered native allocations.
     return max_free_;
   }
+
+  ALWAYS_INLINE void IncrementNumberOfBytesFreedRevoke(size_t freed_bytes_revoke);
 
   void TraceHeapSize(size_t heap_size);
 
@@ -1227,7 +1226,8 @@ class Heap {
   // Since the heap was created, how many objects have been freed.
   uint64_t total_objects_freed_ever_;
 
-  // Number of bytes allocated.  Adjusted after each allocation and free.
+  // Number of bytes currently allocated and not yet reclaimed. Includes active
+  // TLABS in their entirety, even if they have not yet been parceled out.
   Atomic<size_t> num_bytes_allocated_;
 
   // Number of registered native bytes allocated since the last time GC was
@@ -1349,7 +1349,8 @@ class Heap {
 
   std::vector<collector::GarbageCollector*> garbage_collectors_;
   collector::SemiSpace* semi_space_collector_;
-  collector::MarkCompact* mark_compact_collector_;
+  collector::ConcurrentCopying* active_concurrent_copying_collector_;
+  collector::ConcurrentCopying* young_concurrent_copying_collector_;
   collector::ConcurrentCopying* concurrent_copying_collector_;
 
   const bool is_running_on_memory_tool_;
@@ -1437,10 +1438,10 @@ class Heap {
 
   friend class CollectorTransitionTask;
   friend class collector::GarbageCollector;
-  friend class collector::MarkCompact;
   friend class collector::ConcurrentCopying;
   friend class collector::MarkSweep;
   friend class collector::SemiSpace;
+  friend class GCCriticalSection;
   friend class ReferenceQueue;
   friend class ScopedGCCriticalSection;
   friend class VerifyReferenceCardVisitor;

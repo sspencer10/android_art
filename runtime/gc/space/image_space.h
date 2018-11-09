@@ -41,11 +41,12 @@ class ImageSpace : public MemMapSpace {
   // On successful return, the loaded spaces are added to boot_image_spaces (which must be
   // empty on entry) and oat_file_end is updated with the (page-aligned) end of the last
   // oat file.
-  static bool LoadBootImage(const std::string& image_file_name,
-                            const InstructionSet image_instruction_set,
-                            std::vector<space::ImageSpace*>* boot_image_spaces,
-                            uint8_t** oat_file_end)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  static bool LoadBootImage(
+      const std::string& image_location,
+      const InstructionSet image_isa,
+      size_t extra_reservation_size,
+      /*out*/std::vector<std::unique_ptr<space::ImageSpace>>* boot_image_spaces,
+      /*out*/MemMap* extra_reservation) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Try to open an existing app image space.
   static std::unique_ptr<ImageSpace> CreateFromAppImage(const char* image,
@@ -56,9 +57,9 @@ class ImageSpace : public MemMapSpace {
   // Reads the image header from the specified image location for the
   // instruction set image_isa. Returns null on failure, with
   // reason in error_msg.
-  static ImageHeader* ReadImageHeader(const char* image_location,
-                                      InstructionSet image_isa,
-                                      std::string* error_msg);
+  static std::unique_ptr<ImageHeader> ReadImageHeader(const char* image_location,
+                                                      InstructionSet image_isa,
+                                                      std::string* error_msg);
 
   // Give access to the OatFile.
   const OatFile* GetOatFile() const;
@@ -86,11 +87,11 @@ class ImageSpace : public MemMapSpace {
     return image_location_;
   }
 
-  accounting::ContinuousSpaceBitmap* GetLiveBitmap() const OVERRIDE {
+  accounting::ContinuousSpaceBitmap* GetLiveBitmap() const override {
     return live_bitmap_.get();
   }
 
-  accounting::ContinuousSpaceBitmap* GetMarkBitmap() const OVERRIDE {
+  accounting::ContinuousSpaceBitmap* GetMarkBitmap() const override {
     // ImageSpaces have the same bitmap for both live and marked. This helps reduce the number of
     // special cases to test against.
     return live_bitmap_.get();
@@ -102,7 +103,7 @@ class ImageSpace : public MemMapSpace {
   void Sweep(bool /* swap_bitmaps */, size_t* /* freed_objects */, size_t* /* freed_bytes */) {
   }
 
-  bool CanMoveObjects() const OVERRIDE {
+  bool CanMoveObjects() const override {
     return false;
   }
 
@@ -147,16 +148,6 @@ class ImageSpace : public MemMapSpace {
     return Begin() + GetImageHeader().GetImageSize();
   }
 
-  // Return the start of the associated oat file.
-  uint8_t* GetOatFileBegin() const {
-    return GetImageHeader().GetOatFileBegin();
-  }
-
-  // Return the end of the associated oat file.
-  uint8_t* GetOatFileEnd() const {
-    return GetImageHeader().GetOatFileEnd();
-  }
-
   void DumpSections(std::ostream& os) const;
 
   // De-initialize the image-space by undoing the effects in Init().
@@ -182,8 +173,8 @@ class ImageSpace : public MemMapSpace {
 
   ImageSpace(const std::string& name,
              const char* image_location,
-             MemMap* mem_map,
-             accounting::ContinuousSpaceBitmap* live_bitmap,
+             MemMap&& mem_map,
+             std::unique_ptr<accounting::ContinuousSpaceBitmap> live_bitmap,
              uint8_t* end);
 
   // The OatFile associated with the image during early startup to
@@ -197,23 +188,11 @@ class ImageSpace : public MemMapSpace {
 
   const std::string image_location_;
 
-  friend class ImageSpaceLoader;
   friend class Space;
 
  private:
-  // Create a boot image space from an image file for a specified instruction
-  // set. Cannot be used for future allocation or collected.
-  //
-  // Create also opens the OatFile associated with the image file so
-  // that it be contiguously allocated with the image before the
-  // creation of the alloc space. The ReleaseOatFile will later be
-  // used to transfer ownership of the OatFile to the ClassLinker when
-  // it is initialized.
-  static std::unique_ptr<ImageSpace> CreateBootImage(const char* image,
-                                     InstructionSet image_isa,
-                                     bool secondary_image,
-                                     std::string* error_msg)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  class Loader;
+  class BootImageLoader;
 
   DISALLOW_COPY_AND_ASSIGN(ImageSpace);
 };

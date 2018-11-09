@@ -75,7 +75,7 @@ namespace linker {
 // The debug sections are written last for easier stripping.
 //
 template <typename ElfTypes>
-class ElfBuilder FINAL {
+class ElfBuilder final {
  public:
   static constexpr size_t kMaxProgramHeaders = 16;
   // SHA-1 digest.  Not using SHA_DIGEST_LENGTH from openssl/sha.h to avoid
@@ -173,21 +173,21 @@ class ElfBuilder FINAL {
 
     // This function always succeeds to simplify code.
     // Use builder's Good() to check the actual status.
-    bool WriteFully(const void* buffer, size_t byte_count) OVERRIDE {
+    bool WriteFully(const void* buffer, size_t byte_count) override {
       CHECK(owner_->current_section_ == this);
       return owner_->stream_.WriteFully(buffer, byte_count);
     }
 
     // This function always succeeds to simplify code.
     // Use builder's Good() to check the actual status.
-    off_t Seek(off_t offset, Whence whence) OVERRIDE {
+    off_t Seek(off_t offset, Whence whence) override {
       // Forward the seek as-is and trust the caller to use it reasonably.
       return owner_->stream_.Seek(offset, whence);
     }
 
     // This function flushes the output and returns whether it succeeded.
     // If there was a previous failure, this does nothing and returns false, i.e. failed.
-    bool Flush() OVERRIDE {
+    bool Flush() override {
       return owner_->stream_.Flush();
     }
 
@@ -271,7 +271,7 @@ class ElfBuilder FINAL {
   };
 
   // Writer of .dynstr section.
-  class CachedStringSection FINAL : public CachedSection {
+  class CachedStringSection final : public CachedSection {
    public:
     CachedStringSection(ElfBuilder<ElfTypes>* owner,
                         const std::string& name,
@@ -295,7 +295,7 @@ class ElfBuilder FINAL {
   };
 
   // Writer of .strtab and .shstrtab sections.
-  class StringSection FINAL : public Section {
+  class StringSection final : public Section {
    public:
     StringSection(ElfBuilder<ElfTypes>* owner,
                   const std::string& name,
@@ -308,9 +308,14 @@ class ElfBuilder FINAL {
                   /* link */ nullptr,
                   /* info */ 0,
                   align,
-                  /* entsize */ 0),
-          current_offset_(0),
-          last_offset_(0) {
+                  /* entsize */ 0) {
+      Reset();
+    }
+
+    void Reset() {
+      current_offset_ = 0;
+      last_name_ = "";
+      last_offset_ = 0;
     }
 
     Elf_Word Write(const std::string& name) {
@@ -333,7 +338,7 @@ class ElfBuilder FINAL {
   };
 
   // Writer of .dynsym and .symtab sections.
-  class SymbolSection FINAL : public Section {
+  class SymbolSection final : public Section {
    public:
     SymbolSection(ElfBuilder<ElfTypes>* owner,
                   const std::string& name,
@@ -405,7 +410,7 @@ class ElfBuilder FINAL {
     std::vector<Elf_Sym> syms_;  // Buffered/cached content of the whole section.
   };
 
-  class AbiflagsSection FINAL : public Section {
+  class AbiflagsSection final : public Section {
    public:
     // Section with Mips abiflag info.
     static constexpr uint8_t MIPS_AFL_REG_NONE =         0;  // no registers
@@ -475,7 +480,7 @@ class ElfBuilder FINAL {
     } abiflags_;
   };
 
-  class BuildIdSection FINAL : public Section {
+  class BuildIdSection final : public Section {
    public:
     BuildIdSection(ElfBuilder<ElfTypes>* owner,
                    const std::string& name,
@@ -529,6 +534,8 @@ class ElfBuilder FINAL {
         stream_(output),
         rodata_(this, ".rodata", SHT_PROGBITS, SHF_ALLOC, nullptr, 0, kPageSize, 0),
         text_(this, ".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, nullptr, 0, kPageSize, 0),
+        data_bimg_rel_ro_(
+            this, ".data.bimg.rel.ro", SHT_PROGBITS, SHF_ALLOC, nullptr, 0, kPageSize, 0),
         bss_(this, ".bss", SHT_NOBITS, SHF_ALLOC, nullptr, 0, kPageSize, 0),
         dex_(this, ".dex", SHT_NOBITS, SHF_ALLOC, nullptr, 0, kPageSize, 0),
         dynstr_(this, ".dynstr", SHF_ALLOC, kPageSize),
@@ -548,10 +555,12 @@ class ElfBuilder FINAL {
         build_id_(this, ".note.gnu.build-id", SHT_NOTE, SHF_ALLOC, nullptr, 0, 4, 0),
         current_section_(nullptr),
         started_(false),
+        finished_(false),
         write_program_headers_(false),
         loaded_size_(0u),
         virtual_address_(0) {
     text_.phdr_flags_ = PF_R | PF_X;
+    data_bimg_rel_ro_.phdr_flags_ = PF_R | PF_W;  // Shall be made read-only at run time.
     bss_.phdr_flags_ = PF_R | PF_W;
     dex_.phdr_flags_ = PF_R;
     dynamic_.phdr_flags_ = PF_R | PF_W;
@@ -566,6 +575,7 @@ class ElfBuilder FINAL {
   BuildIdSection* GetBuildId() { return &build_id_; }
   Section* GetRoData() { return &rodata_; }
   Section* GetText() { return &text_; }
+  Section* GetDataBimgRelRo() { return &data_bimg_rel_ro_; }
   Section* GetBss() { return &bss_; }
   Section* GetDex() { return &dex_; }
   StringSection* GetStrTab() { return &strtab_; }
@@ -623,8 +633,10 @@ class ElfBuilder FINAL {
     write_program_headers_ = write_program_headers;
   }
 
-  void End() {
+  off_t End() {
     DCHECK(started_);
+    DCHECK(!finished_);
+    finished_ = true;
 
     // Note: loaded_size_ == 0 for tests that don't write .rodata, .text, .bss,
     // .dynstr, dynsym, .hash and .dynamic. These tests should not read loaded_size_.
@@ -658,6 +670,7 @@ class ElfBuilder FINAL {
     Elf_Off section_headers_offset;
     section_headers_offset = AlignFileOffset(sizeof(Elf_Off));
     stream_.WriteFully(shdrs.data(), shdrs.size() * sizeof(shdrs[0]));
+    off_t file_size = stream_.Seek(0, kSeekCurrent);
 
     // Flush everything else before writing the program headers. This should prevent
     // the OS from reordering writes, so that we don't end up with valid headers
@@ -683,6 +696,39 @@ class ElfBuilder FINAL {
     stream_.WriteFully(&elf_header, sizeof(elf_header));
     stream_.WriteFully(phdrs.data(), phdrs.size() * sizeof(phdrs[0]));
     stream_.Flush();
+
+    return file_size;
+  }
+
+  // This has the same effect as running the "strip" command line tool.
+  // It removes all debugging sections (but it keeps mini-debug-info).
+  // It returns the ELF file size (as the caller needs to truncate it).
+  off_t Strip() {
+    DCHECK(finished_);
+    finished_ = false;
+    Elf_Off end = 0;
+    std::vector<Section*> non_debug_sections;
+    for (Section* section : sections_) {
+      if (section == &shstrtab_ ||  // Section names will be recreated.
+          section == &symtab_ ||
+          section == &strtab_ ||
+          section->name_.find(".debug_") == 0) {
+        section->header_.sh_offset = 0;
+        section->header_.sh_size = 0;
+        section->section_index_ = 0;
+      } else {
+        if (section->header_.sh_type != SHT_NOBITS) {
+          DCHECK_LE(section->header_.sh_offset, end + kPageSize) << "Large gap between sections";
+          end = std::max<off_t>(end, section->header_.sh_offset + section->header_.sh_size);
+        }
+        non_debug_sections.push_back(section);
+      }
+    }
+    shstrtab_.Reset();
+    // Write the non-debug section headers, program headers, and ELF header again.
+    sections_ = std::move(non_debug_sections);
+    stream_.Seek(end, kSeekSet);
+    return End();
   }
 
   // The running program does not have access to section headers
@@ -694,6 +740,7 @@ class ElfBuilder FINAL {
   void PrepareDynamicSection(const std::string& elf_file_path,
                              Elf_Word rodata_size,
                              Elf_Word text_size,
+                             Elf_Word data_bimg_rel_ro_size,
                              Elf_Word bss_size,
                              Elf_Word bss_methods_offset,
                              Elf_Word bss_roots_offset,
@@ -707,6 +754,9 @@ class ElfBuilder FINAL {
     // Allocate all pre-dynamic sections.
     rodata_.AllocateVirtualMemory(rodata_size);
     text_.AllocateVirtualMemory(text_size);
+    if (data_bimg_rel_ro_size != 0) {
+      data_bimg_rel_ro_.AllocateVirtualMemory(data_bimg_rel_ro_size);
+    }
     if (bss_size != 0) {
       bss_.AllocateVirtualMemory(bss_size);
     }
@@ -734,6 +784,24 @@ class ElfBuilder FINAL {
       Elf_Word oatlastword = dynstr_.Add("oatlastword");
       Elf_Word oatlastword_address = rodata_.GetAddress() + rodata_size - 4;
       dynsym_.Add(oatlastword, &rodata_, oatlastword_address, 4, STB_GLOBAL, STT_OBJECT);
+    }
+    if (data_bimg_rel_ro_size != 0u) {
+      Elf_Word oatdatabimgrelro = dynstr_.Add("oatdatabimgrelro");
+      dynsym_.Add(oatdatabimgrelro,
+                  &data_bimg_rel_ro_,
+                  data_bimg_rel_ro_.GetAddress(),
+                  data_bimg_rel_ro_size,
+                  STB_GLOBAL,
+                  STT_OBJECT);
+      Elf_Word oatdatabimgrelrolastword = dynstr_.Add("oatdatabimgrelrolastword");
+      Elf_Word oatdatabimgrelrolastword_address =
+          data_bimg_rel_ro_.GetAddress() + data_bimg_rel_ro_size - 4;
+      dynsym_.Add(oatdatabimgrelrolastword,
+                  &data_bimg_rel_ro_,
+                  oatdatabimgrelrolastword_address,
+                  4,
+                  STB_GLOBAL,
+                  STT_OBJECT);
     }
     DCHECK_LE(bss_roots_offset, bss_size);
     if (bss_size != 0u) {
@@ -835,6 +903,7 @@ class ElfBuilder FINAL {
   void WriteBuildId(uint8_t build_id[kBuildIdLen]) {
     stream_.Seek(build_id_.GetDigestStart(), kSeekSet);
     stream_.WriteFully(build_id, kBuildIdLen);
+    stream_.Flush();
   }
 
   // Returns true if all writes and seeks on the output stream succeeded.
@@ -1010,6 +1079,7 @@ class ElfBuilder FINAL {
 
   Section rodata_;
   Section text_;
+  Section data_bimg_rel_ro_;
   Section bss_;
   Section dex_;
   CachedStringSection dynstr_;
@@ -1033,6 +1103,7 @@ class ElfBuilder FINAL {
   Section* current_section_;  // The section which is currently being written.
 
   bool started_;
+  bool finished_;
   bool write_program_headers_;
 
   // The size of the memory taken by the ELF file when loaded.

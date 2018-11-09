@@ -53,6 +53,9 @@ func globalFlags(ctx android.BaseContext) ([]string, []string) {
 		cflags = append(cflags, "-DART_HEAP_POISONING=1")
 		asflags = append(asflags, "-DART_HEAP_POISONING=1")
 	}
+	if envTrue(ctx, "ART_USE_CXX_INTERPRETER") {
+		cflags = append(cflags, "-DART_USE_CXX_INTERPRETER=1")
+	}
 
 	if !envFalse(ctx, "ART_USE_READ_BARRIER") && ctx.AConfig().ArtUseReadBarrier() {
 		// Used to change the read barrier type. Valid values are BAKER, BROOKS,
@@ -66,8 +69,12 @@ func globalFlags(ctx android.BaseContext) ([]string, []string) {
 			"-DART_READ_BARRIER_TYPE_IS_"+barrierType+"=1")
 	}
 
-  cdexLevel := envDefault(ctx, "ART_DEFAULT_COMPACT_DEX_LEVEL", "fast")
-  cflags = append(cflags, "-DART_DEFAULT_COMPACT_DEX_LEVEL="+cdexLevel)
+	if !envFalse(ctx, "ART_USE_GENERATIONAL_CC") {
+		cflags = append(cflags, "-DART_USE_GENERATIONAL_CC=1")
+	}
+
+	cdexLevel := envDefault(ctx, "ART_DEFAULT_COMPACT_DEX_LEVEL", "fast")
+	cflags = append(cflags, "-DART_DEFAULT_COMPACT_DEX_LEVEL="+cdexLevel)
 
 	// We need larger stack overflow guards for ASAN, as the compiled code will have
 	// larger frame sizes. For simplicity, just use global not-target-specific cflags.
@@ -278,6 +285,8 @@ func init() {
 	android.RegisterModuleType("art_cc_test", artTest)
 	android.RegisterModuleType("art_cc_test_library", artTestLibrary)
 	android.RegisterModuleType("art_cc_defaults", artDefaultsFactory)
+	android.RegisterModuleType("libart_cc_defaults", libartDefaultsFactory)
+	android.RegisterModuleType("libart_static_cc_defaults", libartStaticDefaultsFactory)
 	android.RegisterModuleType("art_global_defaults", artGlobalDefaultsFactory)
 	android.RegisterModuleType("art_debug_defaults", artDebugDefaultsFactory)
 }
@@ -300,6 +309,61 @@ func artDefaultsFactory() android.Module {
 	c := &codegenProperties{}
 	module := cc.DefaultsFactory(c)
 	android.AddLoadHook(module, func(ctx android.LoadHookContext) { codegen(ctx, c, true) })
+
+	return module
+}
+
+func libartDefaultsFactory() android.Module {
+	c := &codegenProperties{}
+	module := cc.DefaultsFactory(c)
+	android.AddLoadHook(module, func(ctx android.LoadHookContext) {
+		codegen(ctx, c, true)
+
+		type props struct {
+			Target struct {
+				Android struct {
+					Shared_libs []string
+				}
+			}
+		}
+
+		p := &props{}
+		// TODO: express this in .bp instead b/79671158
+		if !envTrue(ctx, "ART_TARGET_LINUX") {
+			p.Target.Android.Shared_libs = []string{
+				"libmetricslogger",
+			}
+		}
+		ctx.AppendProperties(p)
+	})
+
+	return module
+}
+
+func libartStaticDefaultsFactory() android.Module {
+	c := &codegenProperties{}
+	module := cc.DefaultsFactory(c)
+	android.AddLoadHook(module, func(ctx android.LoadHookContext) {
+		codegen(ctx, c, true)
+
+		type props struct {
+			Target struct {
+				Android struct {
+					Static_libs []string
+				}
+			}
+		}
+
+		p := &props{}
+		// TODO: express this in .bp instead b/79671158
+		if !envTrue(ctx, "ART_TARGET_LINUX") {
+			p.Target.Android.Static_libs = []string{
+				"libmetricslogger",
+				"libstatssocket",
+			}
+		}
+		ctx.AppendProperties(p)
+	})
 
 	return module
 }

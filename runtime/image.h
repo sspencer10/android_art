@@ -19,15 +19,15 @@
 
 #include <string.h>
 
-#include "base/bit_utils.h"
 #include "base/enums.h"
-#include "globals.h"
+#include "base/globals.h"
 #include "mirror/object.h"
 
 namespace art {
 
 class ArtField;
 class ArtMethod;
+template <class MirrorType> class ObjPtr;
 
 namespace linker {
 class ImageWriter;
@@ -108,8 +108,6 @@ class PACKED(4) ImageHeader {
         patch_delta_(0),
         image_roots_(0U),
         pointer_size_(0U),
-        compile_pic_(0),
-        is_pic_(0),
         storage_mode_(kDefaultStorageMode),
         data_size_(0) {}
 
@@ -127,8 +125,6 @@ class PACKED(4) ImageHeader {
               uint32_t boot_oat_begin,
               uint32_t boot_oat_size,
               uint32_t pointer_size,
-              bool compile_pic,
-              bool is_pic,
               StorageMode storage_mode,
               size_t data_size);
 
@@ -175,11 +171,11 @@ class PACKED(4) ImageHeader {
     return pointer_size_;
   }
 
-  off_t GetPatchDelta() const {
+  int32_t GetPatchDelta() const {
     return patch_delta_;
   }
 
-  void SetPatchDelta(off_t patch_delta) {
+  void SetPatchDelta(int32_t patch_delta) {
     patch_delta_ = patch_delta;
   }
 
@@ -207,10 +203,28 @@ class PACKED(4) ImageHeader {
   enum ImageRoot {
     kDexCaches,
     kClassRoots,
-    kClassLoader,  // App image only.
+    kOomeWhenThrowingException,       // Pre-allocated OOME when throwing exception.
+    kOomeWhenThrowingOome,            // Pre-allocated OOME when throwing OOME.
+    kOomeWhenHandlingStackOverflow,   // Pre-allocated OOME when handling StackOverflowError.
+    kNoClassDefFoundError,            // Pre-allocated NoClassDefFoundError.
+    kSpecialRoots,                    // Different for boot image and app image, see aliases below.
     kImageRootsMax,
+
+    // Aliases.
+    kAppImageClassLoader = kSpecialRoots,   // The class loader used to build the app image.
+    kBootImageLiveObjects = kSpecialRoots,  // Array of boot image objects that must be kept live.
   };
 
+  /*
+   * This describes the number and ordering of sections inside of Boot
+   * and App Images.  It is very important that changes to this struct
+   * are reflected in the compiler and loader.
+   *
+   * See:
+   *   - ImageWriter::ImageInfo::CreateImageSections()
+   *   - ImageWriter::Write()
+   *   - ImageWriter::AllocMemory()
+   */
   enum ImageSections {
     kSectionObjects,
     kSectionArtFields,
@@ -221,16 +235,19 @@ class PACKED(4) ImageHeader {
     kSectionDexCacheArrays,
     kSectionInternedStrings,
     kSectionClassTable,
+    kSectionStringReferenceOffsets,
+    kSectionMetadata,
     kSectionImageBitmap,
     kSectionCount,  // Number of elements in enum.
   };
 
-  static size_t NumberOfImageRoots(bool app_image) {
-    return app_image ? kImageRootsMax : kImageRootsMax - 1u;
+  static size_t NumberOfImageRoots(bool app_image ATTRIBUTE_UNUSED) {
+    // At the moment, boot image and app image have the same number of roots,
+    // though the meaning of the kSpecialRoots is different.
+    return kImageRootsMax;
   }
 
   ArtMethod* GetImageMethod(ImageMethod index) const;
-  void SetImageMethod(ImageMethod index, ArtMethod* method);
 
   const ImageSection& GetImageSection(ImageSections index) const {
     DCHECK_LT(static_cast<size_t>(index), kSectionCount);
@@ -273,29 +290,29 @@ class PACKED(4) ImageHeader {
     return GetImageSection(kSectionClassTable);
   }
 
+  const ImageSection& GetImageStringReferenceOffsetsSection() const {
+    return GetImageSection(kSectionStringReferenceOffsets);
+  }
+
+  const ImageSection& GetMetadataSection() const {
+    return GetImageSection(kSectionMetadata);
+  }
+
   const ImageSection& GetImageBitmapSection() const {
     return GetImageSection(kSectionImageBitmap);
   }
 
   template <ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
-  mirror::Object* GetImageRoot(ImageRoot image_root) const
+  ObjPtr<mirror::Object> GetImageRoot(ImageRoot image_root) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   template <ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
-  mirror::ObjectArray<mirror::Object>* GetImageRoots() const
+  ObjPtr<mirror::ObjectArray<mirror::Object>> GetImageRoots() const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void RelocateImage(off_t delta);
-  void RelocateImageMethods(off_t delta);
-  void RelocateImageObjects(off_t delta);
-
-  bool CompilePic() const {
-    return compile_pic_ != 0;
-  }
-
-  bool IsPic() const {
-    return is_pic_ != 0;
-  }
+  void RelocateImage(int64_t delta);
+  void RelocateImageMethods(int64_t delta);
+  void RelocateImageObjects(int64_t delta);
 
   uint32_t GetBootImageBegin() const {
     return boot_image_begin_;
@@ -325,22 +342,6 @@ class PACKED(4) ImageHeader {
     // App images currently require a boot image, if the size is non zero then it is an app image
     // header.
     return boot_image_size_ != 0u;
-  }
-
-  uint32_t GetBootImageConstantTablesOffset() const {
-    // Interned strings table and class table for boot image are mmapped read only.
-    DCHECK(!IsAppImage());
-    const ImageSection& interned_strings = GetInternedStringsSection();
-    DCHECK_ALIGNED(interned_strings.Offset(), kPageSize);
-    return interned_strings.Offset();
-  }
-
-  uint32_t GetBootImageConstantTablesSize() const {
-    uint32_t start_offset = GetBootImageConstantTablesOffset();
-    const ImageSection& class_table = GetClassTableSection();
-    DCHECK_LE(start_offset, class_table.Offset());
-    size_t tables_size = class_table.Offset() + class_table.Size() - start_offset;
-    return RoundUp(tables_size, kPageSize);
   }
 
   // Visit mirror::Objects in the section starting at base.
@@ -429,14 +430,6 @@ class PACKED(4) ImageHeader {
   // Pointer size, this affects the size of the ArtMethods.
   uint32_t pointer_size_;
 
-  // Boolean (0 or 1) to denote if the image was compiled with --compile-pic option
-  const uint32_t compile_pic_;
-
-  // Boolean (0 or 1) to denote if the image can be mapped at a random address, this only refers to
-  // the .art file. Currently, app oat files do not depend on their app image. There are no pointers
-  // from the app oat code to the app image.
-  const uint32_t is_pic_;
-
   // Image section sizes/offsets correspond to the uncompressed form.
   ImageSection sections_[kSectionCount];
 
@@ -452,6 +445,80 @@ class PACKED(4) ImageHeader {
 
   friend class linker::ImageWriter;
 };
+
+/*
+ * This type holds the information necessary to fix up AppImage string
+ * references.
+ *
+ * The first element of the pair is an offset into the image space.  If the
+ * offset is tagged (testable using HasDexCacheNativeRefTag) it indicates the location
+ * of a DexCache object that has one or more native references to managed
+ * strings that need to be fixed up.  In this case the second element has no
+ * meaningful value.
+ *
+ * If the first element isn't tagged then it indicates the location of a
+ * managed object with a field that needs fixing up.  In this case the second
+ * element of the pair is an object-relative offset to the field in question.
+ */
+typedef std::pair<uint32_t, uint32_t> AppImageReferenceOffsetInfo;
+
+/*
+ * Tags the last bit.  Used by AppImage logic to differentiate between pointers
+ * to managed objects and pointers to native reference arrays.
+ */
+template<typename T>
+T SetDexCacheStringNativeRefTag(T val) {
+  static_assert(std::is_integral<T>::value, "Expected integral type.");
+
+  return val | 1u;
+}
+
+/*
+ * Tags the second last bit.  Used by AppImage logic to differentiate between pointers
+ * to managed objects and pointers to native reference arrays.
+ */
+template<typename T>
+T SetDexCachePreResolvedStringNativeRefTag(T val) {
+  static_assert(std::is_integral<T>::value, "Expected integral type.");
+
+  return val | 2u;
+}
+
+/*
+ * Retrieves the value of the last bit.  Used by AppImage logic to
+ * differentiate between pointers to managed objects and pointers to native
+ * reference arrays.
+ */
+template<typename T>
+bool HasDexCacheStringNativeRefTag(T val) {
+  static_assert(std::is_integral<T>::value, "Expected integral type.");
+
+  return (val & 1u) != 0u;
+}
+
+/*
+ * Retrieves the value of the second last bit.  Used by AppImage logic to
+ * differentiate between pointers to managed objects and pointers to native
+ * reference arrays.
+ */
+template<typename T>
+bool HasDexCachePreResolvedStringNativeRefTag(T val) {
+  static_assert(std::is_integral<T>::value, "Expected integral type.");
+
+  return (val & 2u) != 0u;
+}
+
+/*
+ * Sets the last bit of the value to 0.  Used by AppImage logic to
+ * differentiate between pointers to managed objects and pointers to native
+ * reference arrays.
+ */
+template<typename T>
+T ClearDexCacheNativeRefTags(T val) {
+  static_assert(std::is_integral<T>::value, "Expected integral type.");
+
+  return val & ~3u;
+}
 
 std::ostream& operator<<(std::ostream& os, const ImageHeader::ImageMethod& policy);
 std::ostream& operator<<(std::ostream& os, const ImageHeader::ImageRoot& policy);

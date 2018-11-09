@@ -47,6 +47,11 @@ class CodeItemInstructionAccessor {
     return insns_size_in_code_units_;
   }
 
+  uint32_t InsnsSizeInBytes() const {
+    static constexpr uint32_t kCodeUnitSizeInBytes = 2u;
+    return insns_size_in_code_units_ * kCodeUnitSizeInBytes;
+  }
+
   const uint16_t* Insns() const {
     return insns_;
   }
@@ -75,7 +80,7 @@ class CodeItemInstructionAccessor {
   uint32_t insns_size_in_code_units_ = 0;
 
   // Pointer to the instructions, null if there is no code item.
-  const uint16_t* insns_ = 0;
+  const uint16_t* insns_ = nullptr;
 };
 
 // Abstracts accesses to code item fields other than debug info for CompactDexFile and
@@ -146,11 +151,20 @@ class CodeItemDebugInfoAccessor : public CodeItemDataAccessor {
     return debug_info_offset_;
   }
 
-  template<typename NewLocalCallback>
+  template<typename NewLocalVisitor>
   bool DecodeDebugLocalInfo(bool is_static,
                             uint32_t method_idx,
-                            NewLocalCallback new_local,
-                            void* context) const;
+                            const NewLocalVisitor& new_local) const;
+
+  // Visit each parameter in the debug information. Returns the line number.
+  // The argument of the Visitor is dex::StringIndex.
+  template <typename Visitor>
+  uint32_t VisitParameterNames(const Visitor& visitor) const;
+
+  template <typename Visitor>
+  bool DecodeDebugPositionInfo(const Visitor& visitor) const;
+
+  bool GetLineNumForPc(const uint32_t pc, uint32_t* line_num) const;
 
  protected:
   ALWAYS_INLINE void Init(const CompactDexFile::CodeItem& code_item, uint32_t dex_method_index);

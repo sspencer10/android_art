@@ -214,5 +214,24 @@
   description: "java.io.IOException: Error writing ASN.1 encoding",
   result: EXEC_FAILED,
   names: ["libcore.javax.crypto.spec.AlgorithmParametersTestGCM#testEncoding"]
+},
+{
+  description: "fdsan doesn't exist on the host",
+  result: EXEC_FAILED,
+  modes: [host],
+  bug: 113177877,
+  names: ["libcore.libcore.io.FdsanTest#testFileInputStream",
+          "libcore.libcore.io.FdsanTest#testFileOutputStream",
+          "libcore.libcore.io.FdsanTest#testRandomAccessFile",
+          "libcore.libcore.io.FdsanTest#testParcelFileDescriptor",
+          "libcore.libcore.io.FdsanTest#testDatagramSocket",
+          "libcore.libcore.io.FdsanTest#testSocket"]
+},
+{
+  description: "Timeout on heap-poisoning target builds",
+  result: EXEC_FAILED,
+  modes: [device],
+  bug: 116446372,
+  names: ["libcore.libcore.io.FdsanTest#testSocket"]
 }
 ]

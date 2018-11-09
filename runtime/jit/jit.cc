@@ -24,14 +24,17 @@
 #include "base/memory_tool.h"
 #include "base/runtime_debug.h"
 #include "base/utils.h"
+#include "class_root.h"
 #include "debugger.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
 #include "interpreter/interpreter.h"
-#include "java_vm_ext.h"
 #include "jit_code_cache.h"
+#include "jni/java_vm_ext.h"
+#include "mirror/method_handle_impl.h"
+#include "mirror/var_handle.h"
 #include "oat_file_manager.h"
 #include "oat_quick_method_header.h"
-#include "profile_compilation_info.h"
+#include "profile/profile_compilation_info.h"
 #include "profile_saver.h"
 #include "runtime.h"
 #include "runtime_options.h"
@@ -44,8 +47,6 @@ namespace art {
 namespace jit {
 
 static constexpr bool kEnableOnStackReplacement = true;
-// At what priority to schedule jit threads. 9 is the lowest foreground priority on device.
-static constexpr int kJitPoolThreadPthreadPriority = 9;
 
 // Different compilation threshold constants. These can be overridden on the command line.
 static constexpr size_t kJitDefaultCompileThreshold           = 10000;  // Non-debug default.
@@ -59,7 +60,6 @@ void* (*Jit::jit_load_)(bool*) = nullptr;
 void (*Jit::jit_unload_)(void*) = nullptr;
 bool (*Jit::jit_compile_method_)(void*, ArtMethod*, Thread*, bool) = nullptr;
 void (*Jit::jit_types_loaded_)(void*, mirror::Class**, size_t count) = nullptr;
-bool Jit::generate_debug_info_ = false;
 
 struct StressModeHelper {
   DECLARE_RUNTIME_DEBUG_FLAG(kSlowMode);
@@ -78,6 +78,8 @@ JitOptions* JitOptions::CreateFromRuntimeArguments(const RuntimeArgumentMap& opt
       options.Exists(RuntimeArgumentMap::DumpJITInfoOnShutdown);
   jit_options->profile_saver_options_ =
       options.GetOrDefault(RuntimeArgumentMap::ProfileSaverOpts);
+  jit_options->thread_pool_pthread_priority_ =
+      options.GetOrDefault(RuntimeArgumentMap::JITPoolThreadPthreadPriority);
 
   if (options.Exists(RuntimeArgumentMap::JITCompileThreshold)) {
     jit_options->compile_threshold_ = *options.Get(RuntimeArgumentMap::JITCompileThreshold);
@@ -165,48 +167,38 @@ void Jit::AddTimingLogger(const TimingLogger& logger) {
   cumulative_timings_.AddLogger(logger);
 }
 
-Jit::Jit() : dump_info_on_shutdown_(false),
-             cumulative_timings_("JIT timings"),
-             memory_use_("Memory used for compilation", 16),
-             lock_("JIT memory use lock"),
-             use_jit_compilation_(true),
-             hot_method_threshold_(0),
-             warm_method_threshold_(0),
-             osr_method_threshold_(0),
-             priority_thread_weight_(0),
-             invoke_transition_weight_(0) {}
+Jit::Jit(JitCodeCache* code_cache, JitOptions* options)
+    : code_cache_(code_cache),
+      options_(options),
+      cumulative_timings_("JIT timings"),
+      memory_use_("Memory used for compilation", 16),
+      lock_("JIT memory use lock") {}
 
-Jit* Jit::Create(JitOptions* options, std::string* error_msg) {
-  DCHECK(options->UseJitCompilation() || options->GetProfileSaverOptions().IsEnabled());
-  std::unique_ptr<Jit> jit(new Jit);
-  jit->dump_info_on_shutdown_ = options->DumpJitInfoOnShutdown();
-  if (jit_compiler_handle_ == nullptr && !LoadCompiler(error_msg)) {
+Jit* Jit::Create(JitCodeCache* code_cache, JitOptions* options) {
+  if (jit_load_ == nullptr) {
+    LOG(WARNING) << "Not creating JIT: library not loaded";
     return nullptr;
   }
-  bool code_cache_only_for_profile_data = !options->UseJitCompilation();
-  jit->code_cache_.reset(JitCodeCache::Create(
-      options->GetCodeCacheInitialCapacity(),
-      options->GetCodeCacheMaxCapacity(),
-      jit->generate_debug_info_,
-      code_cache_only_for_profile_data,
-      error_msg));
-  if (jit->GetCodeCache() == nullptr) {
+  bool will_generate_debug_symbols = false;
+  jit_compiler_handle_ = (jit_load_)(&will_generate_debug_symbols);
+  if (jit_compiler_handle_ == nullptr) {
+    LOG(WARNING) << "Not creating JIT: failed to allocate a compiler";
     return nullptr;
   }
-  jit->use_jit_compilation_ = options->UseJitCompilation();
-  jit->profile_saver_options_ = options->GetProfileSaverOptions();
+  std::unique_ptr<Jit> jit(new Jit(code_cache, options));
+  jit->generate_debug_info_ = will_generate_debug_symbols;
+
+  // With 'perf', we want a 1-1 mapping between an address and a method.
+  // We aren't able to keep method pointers live during the instrumentation method entry trampoline
+  // so we will just disable jit-gc if we are doing that.
+  code_cache->SetGarbageCollectCode(!jit->generate_debug_info_ &&
+      !Runtime::Current()->GetInstrumentation()->AreExitStubsInstalled());
+
   VLOG(jit) << "JIT created with initial_capacity="
       << PrettySize(options->GetCodeCacheInitialCapacity())
       << ", max_capacity=" << PrettySize(options->GetCodeCacheMaxCapacity())
       << ", compile_threshold=" << options->GetCompileThreshold()
       << ", profile_saver_options=" << options->GetProfileSaverOptions();
-
-
-  jit->hot_method_threshold_ = options->GetCompileThreshold();
-  jit->warm_method_threshold_ = options->GetWarmupThreshold();
-  jit->osr_method_threshold_ = options->GetOsrThreshold();
-  jit->priority_thread_weight_ = options->GetPriorityThreadWeight();
-  jit->invoke_transition_weight_ = options->GetInvokeTransitionWeight();
 
   jit->CreateThreadPool();
 
@@ -251,23 +243,6 @@ bool Jit::LoadCompilerLibrary(std::string* error_msg) {
     *error_msg = "JIT couldn't find jit_types_loaded entry point";
     return false;
   }
-  return true;
-}
-
-bool Jit::LoadCompiler(std::string* error_msg) {
-  if (jit_library_handle_ == nullptr && !LoadCompilerLibrary(error_msg)) {
-    return false;
-  }
-  bool will_generate_debug_symbols = false;
-  VLOG(jit) << "Calling JitLoad interpreter_only="
-      << Runtime::Current()->GetInstrumentation()->InterpretOnly();
-  jit_compiler_handle_ = (jit_load_)(&will_generate_debug_symbols);
-  if (jit_compiler_handle_ == nullptr) {
-    dlclose(jit_library_handle_);
-    *error_msg = "JIT couldn't load compiler";
-    return false;
-  }
-  generate_debug_info_ = will_generate_debug_symbols;
   return true;
 }
 
@@ -328,7 +303,7 @@ void Jit::CreateThreadPool() {
   constexpr bool kJitPoolNeedsPeers = true;
   thread_pool_.reset(new ThreadPool("Jit thread pool", 1, kJitPoolNeedsPeers));
 
-  thread_pool_->SetPthreadPriority(kJitPoolThreadPthreadPriority);
+  thread_pool_->SetPthreadPriority(options_->GetThreadPoolPthreadPriority());
   Start();
 }
 
@@ -345,7 +320,7 @@ void Jit::DeleteThreadPool() {
     }
 
     // When running sanitized, let all tasks finish to not leak. Otherwise just clear the queue.
-    if (!RUNNING_ON_MEMORY_TOOL) {
+    if (!kRunningOnMemoryTool) {
       pool->StopWorkers(self);
       pool->RemoveAllTasks(self);
     }
@@ -358,17 +333,14 @@ void Jit::DeleteThreadPool() {
 
 void Jit::StartProfileSaver(const std::string& filename,
                             const std::vector<std::string>& code_paths) {
-  if (profile_saver_options_.IsEnabled()) {
-    ProfileSaver::Start(profile_saver_options_,
-                        filename,
-                        code_cache_.get(),
-                        code_paths);
+  if (options_->GetSaveProfilingInfo()) {
+    ProfileSaver::Start(options_->GetProfileSaverOptions(), filename, code_cache_, code_paths);
   }
 }
 
 void Jit::StopProfileSaver() {
-  if (profile_saver_options_.IsEnabled() && ProfileSaver::IsStarted()) {
-    ProfileSaver::Stop(dump_info_on_shutdown_);
+  if (options_->GetSaveProfilingInfo() && ProfileSaver::IsStarted()) {
+    ProfileSaver::Stop(options_->DumpJitInfoOnShutdown());
   }
 }
 
@@ -381,8 +353,8 @@ bool Jit::CanInvokeCompiledCode(ArtMethod* method) {
 }
 
 Jit::~Jit() {
-  DCHECK(!profile_saver_options_.IsEnabled() || !ProfileSaver::IsStarted());
-  if (dump_info_on_shutdown_) {
+  DCHECK(!options_->GetSaveProfilingInfo() || !ProfileSaver::IsStarted());
+  if (options_->DumpJitInfoOnShutdown()) {
     DumpInfo(LOG_STREAM(INFO));
     Runtime::Current()->DumpDeoptimizations(LOG_STREAM(INFO));
   }
@@ -411,7 +383,7 @@ void Jit::NewTypeLoadedIfUsingJit(mirror::Class* type) {
 
 void Jit::DumpTypeInfoForLoadedTypes(ClassLinker* linker) {
   struct CollectClasses : public ClassVisitor {
-    bool operator()(ObjPtr<mirror::Class> klass) OVERRIDE REQUIRES_SHARED(Locks::mutator_lock_) {
+    bool operator()(ObjPtr<mirror::Class> klass) override REQUIRES_SHARED(Locks::mutator_lock_) {
       classes_.push_back(klass.Ptr());
       return true;
     }
@@ -428,7 +400,7 @@ void Jit::DumpTypeInfoForLoadedTypes(ClassLinker* linker) {
 }
 
 extern "C" void art_quick_osr_stub(void** stack,
-                                   uint32_t stack_size_in_bytes,
+                                   size_t stack_size_in_bytes,
                                    const uint8_t* native_pc,
                                    JValue* result,
                                    const char* shorty,
@@ -486,11 +458,10 @@ bool Jit::MaybeDoOnStackReplacement(Thread* thread,
       return false;
     }
 
-    CodeInfo code_info = osr_method->GetOptimizedCodeInfo();
-    CodeInfoEncoding encoding = code_info.ExtractEncoding();
+    CodeInfo code_info(osr_method);
 
     // Find stack map starting at the target dex_pc.
-    StackMap stack_map = code_info.GetOsrStackMapForDexPc(dex_pc + dex_pc_offset, encoding);
+    StackMap stack_map = code_info.GetOsrStackMapForDexPc(dex_pc + dex_pc_offset);
     if (!stack_map.IsValid()) {
       // There is no OSR stack map for this dex pc offset. Just return to the interpreter in the
       // hope that the next branch has one.
@@ -506,8 +477,7 @@ bool Jit::MaybeDoOnStackReplacement(Thread* thread,
 
     // We found a stack map, now fill the frame with dex register values from the interpreter's
     // shadow frame.
-    DexRegisterMap vreg_map =
-        code_info.GetDexRegisterMapOf(stack_map, encoding, number_of_vregs);
+    DexRegisterMap vreg_map = code_info.GetDexRegisterMapOf(stack_map);
 
     frame_size = osr_method->GetFrameSizeInBytes();
 
@@ -523,13 +493,13 @@ bool Jit::MaybeDoOnStackReplacement(Thread* thread,
     memory[0] = method;
 
     shadow_frame = thread->PopShadowFrame();
-    if (!vreg_map.IsValid()) {
+    if (vreg_map.empty()) {
       // If we don't have a dex register map, then there are no live dex registers at
       // this dex pc.
     } else {
+      DCHECK_EQ(vreg_map.size(), number_of_vregs);
       for (uint16_t vreg = 0; vreg < number_of_vregs; ++vreg) {
-        DexRegisterLocation::Kind location =
-            vreg_map.GetLocationKind(vreg, number_of_vregs, code_info, encoding);
+        DexRegisterLocation::Kind location = vreg_map[vreg].GetKind();
         if (location == DexRegisterLocation::Kind::kNone) {
           // Dex register is dead or uninitialized.
           continue;
@@ -543,17 +513,14 @@ bool Jit::MaybeDoOnStackReplacement(Thread* thread,
         DCHECK_EQ(location, DexRegisterLocation::Kind::kInStack);
 
         int32_t vreg_value = shadow_frame->GetVReg(vreg);
-        int32_t slot_offset = vreg_map.GetStackOffsetInBytes(vreg,
-                                                             number_of_vregs,
-                                                             code_info,
-                                                             encoding);
+        int32_t slot_offset = vreg_map[vreg].GetStackOffsetInBytes();
         DCHECK_LT(slot_offset, static_cast<int32_t>(frame_size));
         DCHECK_GT(slot_offset, 0);
         (reinterpret_cast<int32_t*>(memory))[slot_offset / sizeof(int32_t)] = vreg_value;
       }
     }
 
-    native_pc = stack_map.GetNativePcOffset(encoding.stack_map.encoding, kRuntimeISA) +
+    native_pc = stack_map.GetNativePcOffset(kRuntimeISA) +
         osr_method->GetEntryPoint();
     VLOG(jit) << "Jumping to "
               << method_name
@@ -593,7 +560,7 @@ void Jit::AddMemoryUsage(ArtMethod* method, size_t bytes) {
   memory_use_.AddValue(bytes);
 }
 
-class JitCompileTask FINAL : public Task {
+class JitCompileTask final : public Task {
  public:
   enum TaskKind {
     kAllocateProfile,
@@ -613,22 +580,22 @@ class JitCompileTask FINAL : public Task {
     soa.Vm()->DeleteGlobalRef(soa.Self(), klass_);
   }
 
-  void Run(Thread* self) OVERRIDE {
+  void Run(Thread* self) override {
     ScopedObjectAccess soa(self);
     if (kind_ == kCompile) {
-      Runtime::Current()->GetJit()->CompileMethod(method_, self, /* osr */ false);
+      Runtime::Current()->GetJit()->CompileMethod(method_, self, /* osr= */ false);
     } else if (kind_ == kCompileOsr) {
-      Runtime::Current()->GetJit()->CompileMethod(method_, self, /* osr */ true);
+      Runtime::Current()->GetJit()->CompileMethod(method_, self, /* osr= */ true);
     } else {
       DCHECK(kind_ == kAllocateProfile);
-      if (ProfilingInfo::Create(self, method_, /* retry_allocation */ true)) {
+      if (ProfilingInfo::Create(self, method_, /* retry_allocation= */ true)) {
         VLOG(jit) << "Start profiling " << ArtMethod::PrettyMethod(method_);
       }
     }
     ProfileSaver::NotifyJitActivity();
   }
 
-  void Finalize() OVERRIDE {
+  void Finalize() override {
     delete this;
   }
 
@@ -640,38 +607,57 @@ class JitCompileTask FINAL : public Task {
   DISALLOW_IMPLICIT_CONSTRUCTORS(JitCompileTask);
 };
 
+static bool IgnoreSamplesForMethod(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
+  if (method->IsClassInitializer() || !method->IsCompilable()) {
+    // We do not want to compile such methods.
+    return true;
+  }
+  if (method->IsNative()) {
+    ObjPtr<mirror::Class> klass = method->GetDeclaringClass();
+    if (klass == GetClassRoot<mirror::MethodHandle>() ||
+        klass == GetClassRoot<mirror::VarHandle>()) {
+      // MethodHandle and VarHandle invocation methods are required to throw an
+      // UnsupportedOperationException if invoked reflectively. We achieve this by having native
+      // implementations that arise the exception. We need to disable JIT compilation of these JNI
+      // methods as it can lead to transitioning between JIT compiled JNI stubs and generic JNI
+      // stubs. Since these stubs have different stack representations we can then crash in stack
+      // walking (b/78151261).
+      return true;
+    }
+  }
+  return false;
+}
+
 void Jit::AddSamples(Thread* self, ArtMethod* method, uint16_t count, bool with_backedges) {
   if (thread_pool_ == nullptr) {
     // Should only see this when shutting down.
     DCHECK(Runtime::Current()->IsShuttingDown(self));
     return;
   }
-
-  if (method->IsClassInitializer() || !method->IsCompilable()) {
-    // We do not want to compile such methods.
+  if (IgnoreSamplesForMethod(method)) {
     return;
   }
-  if (hot_method_threshold_ == 0) {
+  if (HotMethodThreshold() == 0) {
     // Tests might request JIT on first use (compiled synchronously in the interpreter).
     return;
   }
   DCHECK(thread_pool_ != nullptr);
-  DCHECK_GT(warm_method_threshold_, 0);
-  DCHECK_GT(hot_method_threshold_, warm_method_threshold_);
-  DCHECK_GT(osr_method_threshold_, hot_method_threshold_);
-  DCHECK_GE(priority_thread_weight_, 1);
-  DCHECK_LE(priority_thread_weight_, hot_method_threshold_);
+  DCHECK_GT(WarmMethodThreshold(), 0);
+  DCHECK_GT(HotMethodThreshold(), WarmMethodThreshold());
+  DCHECK_GT(OSRMethodThreshold(), HotMethodThreshold());
+  DCHECK_GE(PriorityThreadWeight(), 1);
+  DCHECK_LE(PriorityThreadWeight(), HotMethodThreshold());
 
-  int32_t starting_count = method->GetCounter();
+  uint16_t starting_count = method->GetCounter();
   if (Jit::ShouldUsePriorityThreadWeight(self)) {
-    count *= priority_thread_weight_;
+    count *= PriorityThreadWeight();
   }
-  int32_t new_count = starting_count + count;   // int32 here to avoid wrap-around;
+  uint32_t new_count = starting_count + count;
   // Note: Native method have no "warm" state or profiling info.
-  if (LIKELY(!method->IsNative()) && starting_count < warm_method_threshold_) {
-    if ((new_count >= warm_method_threshold_) &&
+  if (LIKELY(!method->IsNative()) && starting_count < WarmMethodThreshold()) {
+    if ((new_count >= WarmMethodThreshold()) &&
         (method->GetProfilingInfo(kRuntimePointerSize) == nullptr)) {
-      bool success = ProfilingInfo::Create(self, method, /* retry_allocation */ false);
+      bool success = ProfilingInfo::Create(self, method, /* retry_allocation= */ false);
       if (success) {
         VLOG(jit) << "Start profiling " << method->PrettyMethod();
       }
@@ -690,23 +676,23 @@ void Jit::AddSamples(Thread* self, ArtMethod* method, uint16_t count, bool with_
       }
     }
     // Avoid jumping more than one state at a time.
-    new_count = std::min(new_count, hot_method_threshold_ - 1);
-  } else if (use_jit_compilation_) {
-    if (starting_count < hot_method_threshold_) {
-      if ((new_count >= hot_method_threshold_) &&
+    new_count = std::min(new_count, static_cast<uint32_t>(HotMethodThreshold() - 1));
+  } else if (UseJitCompilation()) {
+    if (starting_count < HotMethodThreshold()) {
+      if ((new_count >= HotMethodThreshold()) &&
           !code_cache_->ContainsPc(method->GetEntryPointFromQuickCompiledCode())) {
         DCHECK(thread_pool_ != nullptr);
         thread_pool_->AddTask(self, new JitCompileTask(method, JitCompileTask::kCompile));
       }
       // Avoid jumping more than one state at a time.
-      new_count = std::min(new_count, osr_method_threshold_ - 1);
-    } else if (starting_count < osr_method_threshold_) {
+      new_count = std::min(new_count, static_cast<uint32_t>(OSRMethodThreshold() - 1));
+    } else if (starting_count < OSRMethodThreshold()) {
       if (!with_backedges) {
         // If the samples don't contain any back edge, we don't increment the hotness.
         return;
       }
       DCHECK(!method->IsNative());  // No back edges reported for native methods.
-      if ((new_count >= osr_method_threshold_) &&  !code_cache_->IsOsrCompiled(method)) {
+      if ((new_count >= OSRMethodThreshold()) &&  !code_cache_->IsOsrCompiled(method)) {
         DCHECK(thread_pool_ != nullptr);
         thread_pool_->AddTask(self, new JitCompileTask(method, JitCompileTask::kCompileOsr));
       }
@@ -716,26 +702,50 @@ void Jit::AddSamples(Thread* self, ArtMethod* method, uint16_t count, bool with_
   method->SetCounter(new_count);
 }
 
+class ScopedSetRuntimeThread {
+ public:
+  explicit ScopedSetRuntimeThread(Thread* self)
+      : self_(self), was_runtime_thread_(self_->IsRuntimeThread()) {
+    self_->SetIsRuntimeThread(true);
+  }
+
+  ~ScopedSetRuntimeThread() {
+    self_->SetIsRuntimeThread(was_runtime_thread_);
+  }
+
+ private:
+  Thread* self_;
+  bool was_runtime_thread_;
+};
+
 void Jit::MethodEntered(Thread* thread, ArtMethod* method) {
   Runtime* runtime = Runtime::Current();
   if (UNLIKELY(runtime->UseJitCompilation() && runtime->GetJit()->JitAtFirstUse())) {
-    // The compiler requires a ProfilingInfo object.
-    ProfilingInfo::Create(thread,
-                          method->GetInterfaceMethodIfProxy(kRuntimePointerSize),
-                          /* retry_allocation */ true);
-    JitCompileTask compile_task(method, JitCompileTask::kCompile);
-    compile_task.Run(thread);
+    ArtMethod* np_method = method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
+    if (np_method->IsCompilable()) {
+      if (!np_method->IsNative()) {
+        // The compiler requires a ProfilingInfo object for non-native methods.
+        ProfilingInfo::Create(thread, np_method, /* retry_allocation= */ true);
+      }
+      JitCompileTask compile_task(method, JitCompileTask::kCompile);
+      // Fake being in a runtime thread so that class-load behavior will be the same as normal jit.
+      ScopedSetRuntimeThread ssrt(thread);
+      compile_task.Run(thread);
+    }
     return;
   }
 
   ProfilingInfo* profiling_info = method->GetProfilingInfo(kRuntimePointerSize);
   // Update the entrypoint if the ProfilingInfo has one. The interpreter will call it
-  // instead of interpreting the method.
-  if ((profiling_info != nullptr) && (profiling_info->GetSavedEntryPoint() != nullptr)) {
+  // instead of interpreting the method. We don't update it for instrumentation as the entrypoint
+  // must remain the instrumentation entrypoint.
+  if ((profiling_info != nullptr) &&
+      (profiling_info->GetSavedEntryPoint() != nullptr) &&
+      (method->GetEntryPointFromQuickCompiledCode() != GetQuickInstrumentationEntryPoint())) {
     Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(
         method, profiling_info->GetSavedEntryPoint());
   } else {
-    AddSamples(thread, method, 1, /* with_backedges */false);
+    AddSamples(thread, method, 1, /* with_backedges= */false);
   }
 }
 

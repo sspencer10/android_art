@@ -22,6 +22,7 @@
 #include "base/bit_vector-inl.h"
 #include "base/stl_util.h"
 #include "class_linker-inl.h"
+#include "class_root.h"
 #include "code_generator.h"
 #include "common_dominator.h"
 #include "intrinsics.h"
@@ -40,9 +41,8 @@ static constexpr bool kEnableFloatingPointStaticEvaluation = (FLT_EVAL_METHOD ==
 void HGraph::InitializeInexactObjectRTI(VariableSizedHandleScope* handles) {
   ScopedObjectAccess soa(Thread::Current());
   // Create the inexact Object reference type and store it in the HGraph.
-  ClassLinker* linker = Runtime::Current()->GetClassLinker();
   inexact_object_rti_ = ReferenceTypeInfo::Create(
-      handles->NewHandle(linker->GetClassRoot(ClassLinker::kJavaLangObject)),
+      handles->NewHandle(GetClassRoot<mirror::Object>()),
       /* is_exact */ false);
 }
 
@@ -1121,6 +1121,23 @@ void HEnvironment::RemoveAsUserOfInput(size_t index) const {
   user->FixUpUserRecordsAfterEnvUseRemoval(before_env_use_node);
 }
 
+void HEnvironment::ReplaceInput(HInstruction* replacement, size_t index) {
+  const HUserRecord<HEnvironment*>& env_use_record = vregs_[index];
+  HInstruction* orig_instr = env_use_record.GetInstruction();
+
+  DCHECK(orig_instr != replacement);
+
+  HUseList<HEnvironment*>::iterator before_use_node = env_use_record.GetBeforeUseNode();
+  // Note: fixup_end remains valid across splice_after().
+  auto fixup_end = replacement->env_uses_.empty() ? replacement->env_uses_.begin()
+                                                  : ++replacement->env_uses_.begin();
+  replacement->env_uses_.splice_after(replacement->env_uses_.before_begin(),
+                                      env_use_record.GetInstruction()->env_uses_,
+                                      before_use_node);
+  replacement->FixUpUserRecordsAfterEnvUseInsertion(fixup_end);
+  orig_instr->FixUpUserRecordsAfterEnvUseRemoval(before_use_node);
+}
+
 HInstruction* HInstruction::GetNextDisregardingMoves() const {
   HInstruction* next = GetNext();
   while (next != nullptr && next->IsParallelMove()) {
@@ -1283,6 +1300,28 @@ void HInstruction::ReplaceUsesDominatedBy(HInstruction* dominator, HInstruction*
     // Increment `it` now because `*it` may disappear thanks to user->ReplaceInput().
     ++it;
     if (dominator->StrictlyDominates(user)) {
+      user->ReplaceInput(replacement, index);
+    } else if (user->IsPhi() && !user->AsPhi()->IsCatchPhi()) {
+      // If the input flows from a block dominated by `dominator`, we can replace it.
+      // We do not perform this for catch phis as we don't have control flow support
+      // for their inputs.
+      const ArenaVector<HBasicBlock*>& predecessors = user->GetBlock()->GetPredecessors();
+      HBasicBlock* predecessor = predecessors[index];
+      if (dominator->GetBlock()->Dominates(predecessor)) {
+        user->ReplaceInput(replacement, index);
+      }
+    }
+  }
+}
+
+void HInstruction::ReplaceEnvUsesDominatedBy(HInstruction* dominator, HInstruction* replacement) {
+  const HUseList<HEnvironment*>& uses = GetEnvUses();
+  for (auto it = uses.begin(), end = uses.end(); it != end; /* ++it below */) {
+    HEnvironment* user = it->GetUser();
+    size_t index = it->GetIndex();
+    // Increment `it` now because `*it` may disappear thanks to user->ReplaceInput().
+    ++it;
+    if (dominator->StrictlyDominates(user->GetHolder())) {
       user->ReplaceInput(replacement, index);
     }
   }
@@ -1680,10 +1719,9 @@ bool HCondition::IsBeforeWhenDisregardMoves(HInstruction* instruction) const {
 }
 
 bool HInstruction::Equals(const HInstruction* other) const {
-  if (!InstructionTypeEquals(other)) return false;
-  DCHECK_EQ(GetKind(), other->GetKind());
-  if (!InstructionDataEquals(other)) return false;
+  if (GetKind() != other->GetKind()) return false;
   if (GetType() != other->GetType()) return false;
+  if (!InstructionDataEquals(other)) return false;
   HConstInputsRef inputs = GetInputs();
   HConstInputsRef other_inputs = other->GetInputs();
   if (inputs.size() != other_inputs.size()) return false;
@@ -1698,7 +1736,7 @@ bool HInstruction::Equals(const HInstruction* other) const {
 std::ostream& operator<<(std::ostream& os, const HInstruction::InstructionKind& rhs) {
 #define DECLARE_CASE(type, super) case HInstruction::k##type: os << #type; break;
   switch (rhs) {
-    FOR_EACH_INSTRUCTION(DECLARE_CASE)
+    FOR_EACH_CONCRETE_INSTRUCTION(DECLARE_CASE)
     default:
       os << "Unknown instruction kind " << static_cast<int>(rhs);
       break;
@@ -1950,6 +1988,11 @@ bool HBasicBlock::IsSingleTryBoundary() const {
 
 bool HBasicBlock::EndsWithControlFlowInstruction() const {
   return !GetInstructions().IsEmpty() && GetLastInstruction()->IsControlFlow();
+}
+
+bool HBasicBlock::EndsWithReturn() const {
+  return !GetInstructions().IsEmpty() &&
+      (GetLastInstruction()->IsReturn() || GetLastInstruction()->IsReturnVoid());
 }
 
 bool HBasicBlock::EndsWithIf() const {
@@ -2765,6 +2808,14 @@ void HInstruction::SetReferenceTypeInfo(ReferenceTypeInfo rti) {
   SetPackedFlag<kFlagReferenceTypeIsExact>(rti.IsExact());
 }
 
+bool HBoundType::InstructionDataEquals(const HInstruction* other) const {
+  const HBoundType* other_bt = other->AsBoundType();
+  ScopedObjectAccess soa(Thread::Current());
+  return GetUpperBound().IsEqual(other_bt->GetUpperBound()) &&
+         GetUpperCanBeNull() == other_bt->GetUpperCanBeNull() &&
+         CanBeNull() == other_bt->CanBeNull();
+}
+
 void HBoundType::SetUpperBound(const ReferenceTypeInfo& upper_bound, bool can_be_null) {
   if (kIsDebugBuild) {
     ScopedObjectAccess soa(Thread::Current());
@@ -2850,8 +2901,7 @@ void HInvoke::SetIntrinsic(Intrinsics intrinsic,
 }
 
 bool HNewInstance::IsStringAlloc() const {
-  ScopedObjectAccess soa(Thread::Current());
-  return GetReferenceTypeInfo().IsStringClass();
+  return GetEntrypoint() == kQuickAllocStringObject;
 }
 
 bool HInvoke::NeedsEnvironment() const {
@@ -2889,10 +2939,12 @@ std::ostream& operator<<(std::ostream& os, HInvokeStaticOrDirect::MethodLoadKind
       return os << "Recursive";
     case HInvokeStaticOrDirect::MethodLoadKind::kBootImageLinkTimePcRelative:
       return os << "BootImageLinkTimePcRelative";
-    case HInvokeStaticOrDirect::MethodLoadKind::kDirectAddress:
-      return os << "DirectAddress";
+    case HInvokeStaticOrDirect::MethodLoadKind::kBootImageRelRo:
+      return os << "BootImageRelRo";
     case HInvokeStaticOrDirect::MethodLoadKind::kBssEntry:
       return os << "BssEntry";
+    case HInvokeStaticOrDirect::MethodLoadKind::kJitDirectAddress:
+      return os << "JitDirectAddress";
     case HInvokeStaticOrDirect::MethodLoadKind::kRuntimeCall:
       return os << "RuntimeCall";
     default:
@@ -2924,8 +2976,8 @@ bool HLoadClass::InstructionDataEquals(const HInstruction* other) const {
     return false;
   }
   switch (GetLoadKind()) {
-    case LoadKind::kBootImageAddress:
-    case LoadKind::kBootImageClassTable:
+    case LoadKind::kBootImageRelRo:
+    case LoadKind::kJitBootImageAddress:
     case LoadKind::kJitTableAddress: {
       ScopedObjectAccess soa(Thread::Current());
       return GetClass().Get() == other_load_class->GetClass().Get();
@@ -2942,12 +2994,12 @@ std::ostream& operator<<(std::ostream& os, HLoadClass::LoadKind rhs) {
       return os << "ReferrersClass";
     case HLoadClass::LoadKind::kBootImageLinkTimePcRelative:
       return os << "BootImageLinkTimePcRelative";
-    case HLoadClass::LoadKind::kBootImageAddress:
-      return os << "BootImageAddress";
-    case HLoadClass::LoadKind::kBootImageClassTable:
-      return os << "BootImageClassTable";
+    case HLoadClass::LoadKind::kBootImageRelRo:
+      return os << "BootImageRelRo";
     case HLoadClass::LoadKind::kBssEntry:
       return os << "BssEntry";
+    case HLoadClass::LoadKind::kJitBootImageAddress:
+      return os << "JitBootImageAddress";
     case HLoadClass::LoadKind::kJitTableAddress:
       return os << "JitTableAddress";
     case HLoadClass::LoadKind::kRuntimeCall:
@@ -2967,8 +3019,8 @@ bool HLoadString::InstructionDataEquals(const HInstruction* other) const {
     return false;
   }
   switch (GetLoadKind()) {
-    case LoadKind::kBootImageAddress:
-    case LoadKind::kBootImageInternTable:
+    case LoadKind::kBootImageRelRo:
+    case LoadKind::kJitBootImageAddress:
     case LoadKind::kJitTableAddress: {
       ScopedObjectAccess soa(Thread::Current());
       return GetString().Get() == other_load_string->GetString().Get();
@@ -2982,12 +3034,12 @@ std::ostream& operator<<(std::ostream& os, HLoadString::LoadKind rhs) {
   switch (rhs) {
     case HLoadString::LoadKind::kBootImageLinkTimePcRelative:
       return os << "BootImageLinkTimePcRelative";
-    case HLoadString::LoadKind::kBootImageAddress:
-      return os << "BootImageAddress";
-    case HLoadString::LoadKind::kBootImageInternTable:
-      return os << "BootImageInternTable";
+    case HLoadString::LoadKind::kBootImageRelRo:
+      return os << "BootImageRelRo";
     case HLoadString::LoadKind::kBssEntry:
       return os << "BssEntry";
+    case HLoadString::LoadKind::kJitBootImageAddress:
+      return os << "JitBootImageAddress";
     case HLoadString::LoadKind::kJitTableAddress:
       return os << "JitTableAddress";
     case HLoadString::LoadKind::kRuntimeCall:
@@ -3101,6 +3153,8 @@ std::ostream& operator<<(std::ostream& os, TypeCheckKind rhs) {
       return os << "array_object_check";
     case TypeCheckKind::kArrayCheck:
       return os << "array_check";
+    case TypeCheckKind::kBitstringCheck:
+      return os << "bitstring_check";
     default:
       LOG(FATAL) << "Unknown TypeCheckKind: " << static_cast<int>(rhs);
       UNREACHABLE();
@@ -3124,6 +3178,79 @@ std::ostream& operator<<(std::ostream& os, const MemBarrierKind& kind) {
       LOG(FATAL) << "Unknown MemBarrierKind: " << static_cast<int>(kind);
       UNREACHABLE();
   }
+}
+
+// Check that intrinsic enum values fit within space set aside in ArtMethod modifier flags.
+#define CHECK_INTRINSICS_ENUM_VALUES(Name, InvokeType, _, SideEffects, Exceptions, ...) \
+  static_assert( \
+    static_cast<uint32_t>(Intrinsics::k ## Name) <= (kAccIntrinsicBits >> CTZ(kAccIntrinsicBits)), \
+    "Instrinsics enumeration space overflow.");
+#include "intrinsics_list.h"
+  INTRINSICS_LIST(CHECK_INTRINSICS_ENUM_VALUES)
+#undef INTRINSICS_LIST
+#undef CHECK_INTRINSICS_ENUM_VALUES
+
+// Function that returns whether an intrinsic needs an environment or not.
+static inline IntrinsicNeedsEnvironmentOrCache NeedsEnvironmentOrCacheIntrinsic(Intrinsics i) {
+  switch (i) {
+    case Intrinsics::kNone:
+      return kNeedsEnvironmentOrCache;  // Non-sensical for intrinsic.
+#define OPTIMIZING_INTRINSICS(Name, InvokeType, NeedsEnvOrCache, SideEffects, Exceptions, ...) \
+    case Intrinsics::k ## Name: \
+      return NeedsEnvOrCache;
+#include "intrinsics_list.h"
+      INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
+#undef INTRINSICS_LIST
+#undef OPTIMIZING_INTRINSICS
+  }
+  return kNeedsEnvironmentOrCache;
+}
+
+// Function that returns whether an intrinsic has side effects.
+static inline IntrinsicSideEffects GetSideEffectsIntrinsic(Intrinsics i) {
+  switch (i) {
+    case Intrinsics::kNone:
+      return kAllSideEffects;
+#define OPTIMIZING_INTRINSICS(Name, InvokeType, NeedsEnvOrCache, SideEffects, Exceptions, ...) \
+    case Intrinsics::k ## Name: \
+      return SideEffects;
+#include "intrinsics_list.h"
+      INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
+#undef INTRINSICS_LIST
+#undef OPTIMIZING_INTRINSICS
+  }
+  return kAllSideEffects;
+}
+
+// Function that returns whether an intrinsic can throw exceptions.
+static inline IntrinsicExceptions GetExceptionsIntrinsic(Intrinsics i) {
+  switch (i) {
+    case Intrinsics::kNone:
+      return kCanThrow;
+#define OPTIMIZING_INTRINSICS(Name, InvokeType, NeedsEnvOrCache, SideEffects, Exceptions, ...) \
+    case Intrinsics::k ## Name: \
+      return Exceptions;
+#include "intrinsics_list.h"
+      INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
+#undef INTRINSICS_LIST
+#undef OPTIMIZING_INTRINSICS
+  }
+  return kCanThrow;
+}
+
+void HInvoke::SetResolvedMethod(ArtMethod* method) {
+  // TODO: b/65872996 The intent is that polymorphic signature methods should
+  // be compiler intrinsics. At present, they are only interpreter intrinsics.
+  if (method != nullptr &&
+      method->IsIntrinsic() &&
+      !method->IsPolymorphicSignature()) {
+    Intrinsics intrinsic = static_cast<Intrinsics>(method->GetIntrinsic());
+    SetIntrinsic(intrinsic,
+                 NeedsEnvironmentOrCacheIntrinsic(intrinsic),
+                 GetSideEffectsIntrinsic(intrinsic),
+                 GetExceptionsIntrinsic(intrinsic));
+  }
+  resolved_method_ = method;
 }
 
 }  // namespace art

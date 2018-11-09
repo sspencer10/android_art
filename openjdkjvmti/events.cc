@@ -44,8 +44,8 @@
 #include "gc/scoped_gc_critical_section.h"
 #include "handle_scope-inl.h"
 #include "instrumentation.h"
-#include "jni_env_ext-inl.h"
-#include "jni_internal.h"
+#include "jni/jni_env_ext-inl.h"
+#include "jni/jni_internal.h"
 #include "mirror/class.h"
 #include "mirror/object-inl.h"
 #include "monitor.h"
@@ -265,7 +265,7 @@ class JvmtiDdmChunkListener : public art::DdmCallback {
   explicit JvmtiDdmChunkListener(EventHandler* handler) : handler_(handler) {}
 
   void DdmPublishChunk(uint32_t type, const art::ArrayRef<const uint8_t>& data)
-      OVERRIDE REQUIRES_SHARED(art::Locks::mutator_lock_) {
+      override REQUIRES_SHARED(art::Locks::mutator_lock_) {
     if (handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kDdmPublishChunk)) {
       art::Thread* self = art::Thread::Current();
       handler_->DispatchEvent<ArtJvmtiEvent::kDdmPublishChunk>(
@@ -288,7 +288,7 @@ class JvmtiAllocationListener : public art::gc::AllocationListener {
   explicit JvmtiAllocationListener(EventHandler* handler) : handler_(handler) {}
 
   void ObjectAllocated(art::Thread* self, art::ObjPtr<art::mirror::Object>* obj, size_t byte_count)
-      OVERRIDE REQUIRES_SHARED(art::Locks::mutator_lock_) {
+      override REQUIRES_SHARED(art::Locks::mutator_lock_) {
     DCHECK_EQ(self, art::Thread::Current());
 
     if (handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kVmObjectAlloc)) {
@@ -337,7 +337,7 @@ class JvmtiMonitorListener : public art::MonitorCallback {
   explicit JvmtiMonitorListener(EventHandler* handler) : handler_(handler) {}
 
   void MonitorContendedLocking(art::Monitor* m)
-      OVERRIDE REQUIRES_SHARED(art::Locks::mutator_lock_) {
+      override REQUIRES_SHARED(art::Locks::mutator_lock_) {
     if (handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMonitorContendedEnter)) {
       art::Thread* self = art::Thread::Current();
       art::JNIEnvExt* jnienv = self->GetJniEnv();
@@ -351,7 +351,7 @@ class JvmtiMonitorListener : public art::MonitorCallback {
   }
 
   void MonitorContendedLocked(art::Monitor* m)
-      OVERRIDE REQUIRES_SHARED(art::Locks::mutator_lock_) {
+      override REQUIRES_SHARED(art::Locks::mutator_lock_) {
     if (handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMonitorContendedEntered)) {
       art::Thread* self = art::Thread::Current();
       art::JNIEnvExt* jnienv = self->GetJniEnv();
@@ -365,7 +365,7 @@ class JvmtiMonitorListener : public art::MonitorCallback {
   }
 
   void ObjectWaitStart(art::Handle<art::mirror::Object> obj, int64_t timeout)
-      OVERRIDE REQUIRES_SHARED(art::Locks::mutator_lock_) {
+      override REQUIRES_SHARED(art::Locks::mutator_lock_) {
     if (handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMonitorWait)) {
       art::Thread* self = art::Thread::Current();
       art::JNIEnvExt* jnienv = self->GetJniEnv();
@@ -392,7 +392,7 @@ class JvmtiMonitorListener : public art::MonitorCallback {
   //
   // See b/65558434 for more discussion.
   void MonitorWaitFinished(art::Monitor* m, bool timeout)
-      OVERRIDE REQUIRES_SHARED(art::Locks::mutator_lock_) {
+      override REQUIRES_SHARED(art::Locks::mutator_lock_) {
     if (handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMonitorWaited)) {
       art::Thread* self = art::Thread::Current();
       art::JNIEnvExt* jnienv = self->GetJniEnv();
@@ -429,11 +429,11 @@ class JvmtiGcPauseListener : public art::gc::GcPauseListener {
         start_enabled_(false),
         finish_enabled_(false) {}
 
-  void StartPause() OVERRIDE {
+  void StartPause() override {
     handler_->DispatchEvent<ArtJvmtiEvent::kGarbageCollectionStart>(art::Thread::Current());
   }
 
-  void EndPause() OVERRIDE {
+  void EndPause() override {
     handler_->DispatchEvent<ArtJvmtiEvent::kGarbageCollectionFinish>(art::Thread::Current());
   }
 
@@ -475,7 +475,7 @@ static void SetupGcPauseTracking(JvmtiGcPauseListener* listener, ArtJvmtiEvent e
   }
 }
 
-class JvmtiMethodTraceListener FINAL : public art::instrumentation::InstrumentationListener {
+class JvmtiMethodTraceListener final : public art::instrumentation::InstrumentationListener {
  public:
   explicit JvmtiMethodTraceListener(EventHandler* handler) : event_handler_(handler) {}
 
@@ -484,7 +484,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
                      art::Handle<art::mirror::Object> this_object ATTRIBUTE_UNUSED,
                      art::ArtMethod* method,
                      uint32_t dex_pc ATTRIBUTE_UNUSED)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     if (!method->IsRuntimeMethod() &&
         event_handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMethodEntry)) {
       art::JNIEnvExt* jnienv = self->GetJniEnv();
@@ -501,11 +501,12 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
                     art::ArtMethod* method,
                     uint32_t dex_pc ATTRIBUTE_UNUSED,
                     art::Handle<art::mirror::Object> return_value)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     if (!method->IsRuntimeMethod() &&
         event_handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMethodExit)) {
-      DCHECK_EQ(method->GetReturnTypePrimitive(), art::Primitive::kPrimNot)
-          << method->PrettyMethod();
+      DCHECK_EQ(
+          method->GetInterfaceMethodIfProxy(art::kRuntimePointerSize)->GetReturnTypePrimitive(),
+          art::Primitive::kPrimNot) << method->PrettyMethod();
       DCHECK(!self->IsExceptionPending());
       jvalue val;
       art::JNIEnvExt* jnienv = self->GetJniEnv();
@@ -516,7 +517,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
           self,
           jnienv,
           art::jni::EncodeArtMethod(method),
-          /*was_popped_by_exception*/ static_cast<jboolean>(JNI_FALSE),
+          /*was_popped_by_exception=*/ static_cast<jboolean>(JNI_FALSE),
           val);
     }
   }
@@ -527,11 +528,12 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
                     art::ArtMethod* method,
                     uint32_t dex_pc ATTRIBUTE_UNUSED,
                     const art::JValue& return_value)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     if (!method->IsRuntimeMethod() &&
         event_handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMethodExit)) {
-      DCHECK_NE(method->GetReturnTypePrimitive(), art::Primitive::kPrimNot)
-          << method->PrettyMethod();
+      DCHECK_NE(
+          method->GetInterfaceMethodIfProxy(art::kRuntimePointerSize)->GetReturnTypePrimitive(),
+          art::Primitive::kPrimNot) << method->PrettyMethod();
       DCHECK(!self->IsExceptionPending());
       jvalue val;
       art::JNIEnvExt* jnienv = self->GetJniEnv();
@@ -543,7 +545,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
           self,
           jnienv,
           art::jni::EncodeArtMethod(method),
-          /*was_popped_by_exception*/ static_cast<jboolean>(JNI_FALSE),
+          /*was_popped_by_exception=*/ static_cast<jboolean>(JNI_FALSE),
           val);
     }
   }
@@ -554,7 +556,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
                     art::Handle<art::mirror::Object> this_object ATTRIBUTE_UNUSED,
                     art::ArtMethod* method,
                     uint32_t dex_pc ATTRIBUTE_UNUSED)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     if (!method->IsRuntimeMethod() &&
         event_handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kMethodExit)) {
       jvalue val;
@@ -570,7 +572,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
           self,
           jnienv,
           art::jni::EncodeArtMethod(method),
-          /*was_popped_by_exception*/ static_cast<jboolean>(JNI_TRUE),
+          /*was_popped_by_exception=*/ static_cast<jboolean>(JNI_TRUE),
           val);
       // Match RI behavior of just throwing away original exception if a new one is thrown.
       if (LIKELY(!self->IsExceptionPending())) {
@@ -584,7 +586,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
                   art::Handle<art::mirror::Object> this_object ATTRIBUTE_UNUSED,
                   art::ArtMethod* method,
                   uint32_t new_dex_pc)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     DCHECK(!method->IsRuntimeMethod());
     // Default methods might be copied to multiple classes. We need to get the canonical version of
     // this method so that we can check for breakpoints correctly.
@@ -611,7 +613,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
                  art::ArtMethod* method,
                  uint32_t dex_pc,
                  art::ArtField* field)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     if (event_handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kFieldAccess)) {
       art::JNIEnvExt* jnienv = self->GetJniEnv();
       // DCHECK(!self->IsExceptionPending());
@@ -636,7 +638,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
                     uint32_t dex_pc,
                     art::ArtField* field,
                     art::Handle<art::mirror::Object> new_val)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     if (event_handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kFieldModification)) {
       art::JNIEnvExt* jnienv = self->GetJniEnv();
       // DCHECK(!self->IsExceptionPending());
@@ -668,7 +670,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
                     uint32_t dex_pc,
                     art::ArtField* field,
                     const art::JValue& field_value)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     if (event_handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kFieldModification)) {
       art::JNIEnvExt* jnienv = self->GetJniEnv();
       DCHECK(!self->IsExceptionPending());
@@ -698,7 +700,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
   }
 
   void WatchedFramePop(art::Thread* self, const art::ShadowFrame& frame)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
       art::JNIEnvExt* jnienv = self->GetJniEnv();
     jboolean is_exception_pending = self->IsExceptionPending();
     RunEventCallback<ArtJvmtiEvent::kFramePop>(
@@ -718,7 +720,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
     // Finds the location where this exception will most likely be caught. We ignore intervening
     // native frames (which could catch the exception) and return the closest java frame with a
     // compatible catch statement.
-    class CatchLocationFinder FINAL : public art::StackVisitor {
+    class CatchLocationFinder final : public art::StackVisitor {
      public:
       CatchLocationFinder(art::Thread* target,
                           art::Handle<art::mirror::Class> exception_class,
@@ -731,7 +733,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
           catch_method_ptr_(out_catch_method),
           catch_dex_pc_ptr_(out_catch_pc) {}
 
-      bool VisitFrame() OVERRIDE REQUIRES_SHARED(art::Locks::mutator_lock_) {
+      bool VisitFrame() override REQUIRES_SHARED(art::Locks::mutator_lock_) {
         art::ArtMethod* method = GetMethod();
         DCHECK(method != nullptr);
         if (method->IsRuntimeMethod()) {
@@ -775,12 +777,12 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
                             context.get(),
                             /*out*/ out_method,
                             /*out*/ dex_pc);
-    clf.WalkStack(/* include_transitions */ false);
+    clf.WalkStack(/* include_transitions= */ false);
   }
 
   // Call-back when an exception is thrown.
   void ExceptionThrown(art::Thread* self, art::Handle<art::mirror::Throwable> exception_object)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     DCHECK(self->IsExceptionThrownByCurrentMethod(exception_object.Get()));
     // The instrumentation events get rid of this for us.
     DCHECK(!self->IsExceptionPending());
@@ -791,8 +793,8 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
       FindCatchMethodsFromThrow(self, exception_object, &catch_method, &catch_pc);
       uint32_t dex_pc = 0;
       art::ArtMethod* method = self->GetCurrentMethod(&dex_pc,
-                                                      /* check_suspended */ true,
-                                                      /* abort_on_error */ art::kIsDebugBuild);
+                                                      /* check_suspended= */ true,
+                                                      /* abort_on_error= */ art::kIsDebugBuild);
       ScopedLocalRef<jobject> exception(jnienv,
                                         AddLocalRef<jobject>(jnienv, exception_object.Get()));
       RunEventCallback<ArtJvmtiEvent::kException>(
@@ -810,15 +812,15 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
 
   // Call-back when an exception is handled.
   void ExceptionHandled(art::Thread* self, art::Handle<art::mirror::Throwable> exception_object)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     // Since the exception has already been handled there shouldn't be one pending.
     DCHECK(!self->IsExceptionPending());
     if (event_handler_->IsEventEnabledAnywhere(ArtJvmtiEvent::kExceptionCatch)) {
       art::JNIEnvExt* jnienv = self->GetJniEnv();
       uint32_t dex_pc;
       art::ArtMethod* method = self->GetCurrentMethod(&dex_pc,
-                                                      /* check_suspended */ true,
-                                                      /* abort_on_error */ art::kIsDebugBuild);
+                                                      /* check_suspended= */ true,
+                                                      /* abort_on_error= */ art::kIsDebugBuild);
       ScopedLocalRef<jobject> exception(jnienv,
                                         AddLocalRef<jobject>(jnienv, exception_object.Get()));
       RunEventCallback<ArtJvmtiEvent::kExceptionCatch>(
@@ -837,17 +839,7 @@ class JvmtiMethodTraceListener FINAL : public art::instrumentation::Instrumentat
               art::ArtMethod* method ATTRIBUTE_UNUSED,
               uint32_t dex_pc ATTRIBUTE_UNUSED,
               int32_t dex_pc_offset ATTRIBUTE_UNUSED)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
-    return;
-  }
-
-  // Call-back for when we get an invokevirtual or an invokeinterface.
-  void InvokeVirtualOrInterface(art::Thread* self ATTRIBUTE_UNUSED,
-                                art::Handle<art::mirror::Object> this_object ATTRIBUTE_UNUSED,
-                                art::ArtMethod* caller ATTRIBUTE_UNUSED,
-                                uint32_t dex_pc ATTRIBUTE_UNUSED,
-                                art::ArtMethod* callee ATTRIBUTE_UNUSED)
-      REQUIRES_SHARED(art::Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(art::Locks::mutator_lock_) override {
     return;
   }
 
@@ -957,7 +949,7 @@ void EventHandler::HandleLocalAccessCapabilityAdded() {
         : runtime_(runtime) {}
 
     bool operator()(art::ObjPtr<art::mirror::Class> klass)
-        OVERRIDE REQUIRES(art::Locks::mutator_lock_) {
+        override REQUIRES(art::Locks::mutator_lock_) {
       if (!klass->IsLoaded()) {
         // Skip classes that aren't loaded since they might not have fully allocated and initialized
         // their methods. Furthemore since the jvmti-plugin must have been loaded by this point
@@ -1001,6 +993,27 @@ bool EventHandler::OtherMonitorEventsEnabledAnywhere(ArtJvmtiEvent event) {
   return false;
 }
 
+void EventHandler::SetupFramePopTraceListener(bool enable) {
+  if (enable) {
+    frame_pop_enabled = true;
+    SetupTraceListener(method_trace_listener_.get(), ArtJvmtiEvent::kFramePop, enable);
+  } else {
+    // remove the listener if we have no outstanding frames.
+    {
+      art::ReaderMutexLock mu(art::Thread::Current(), envs_lock_);
+      for (ArtJvmTiEnv* env : envs) {
+        art::ReaderMutexLock event_mu(art::Thread::Current(), env->event_info_mutex_);
+        if (!env->notify_frames.empty()) {
+          // Leaving FramePop listener since there are unsent FramePop events.
+          return;
+        }
+      }
+      frame_pop_enabled = false;
+    }
+    SetupTraceListener(method_trace_listener_.get(), ArtJvmtiEvent::kFramePop, enable);
+  }
+}
+
 // Handle special work for the given event type, if necessary.
 void EventHandler::HandleEventType(ArtJvmtiEvent event, bool enable) {
   switch (event) {
@@ -1015,14 +1028,14 @@ void EventHandler::HandleEventType(ArtJvmtiEvent event, bool enable) {
     case ArtJvmtiEvent::kGarbageCollectionFinish:
       SetupGcPauseTracking(gc_pause_listener_.get(), event, enable);
       return;
-    // FramePop can never be disabled once it's been turned on since we would either need to deal
-    // with dangling pointers or have missed events.
-    // TODO We really need to make this not the case anymore.
+    // FramePop can never be disabled once it's been turned on if it was turned off with outstanding
+    // pop-events since we would either need to deal with dangling pointers or have missed events.
     case ArtJvmtiEvent::kFramePop:
-      if (!enable || (enable && frame_pop_enabled)) {
+      if (enable && frame_pop_enabled) {
+        // The frame-pop event was held on by pending events so we don't need to do anything.
         break;
       } else {
-        SetupTraceListener(method_trace_listener_.get(), event, enable);
+        SetupFramePopTraceListener(enable);
         break;
       }
     case ArtJvmtiEvent::kMethodEntry:

@@ -21,7 +21,8 @@
 #include "class_linker-inl.h"
 #include "common_runtime_test.h"
 #include "dex/dex_file.h"
-#include "mirror/array-inl.h"
+#include "mirror/array-alloc-inl.h"
+#include "mirror/class-alloc-inl.h"
 #include "scoped_thread_state_change-inl.h"
 
 namespace art {
@@ -506,7 +507,7 @@ TEST_F(TransactionTest, ResolveString) {
         class_linker_->LookupString(string_idx, h_dex_cache.Get());
     ASSERT_TRUE(s != nullptr);
     EXPECT_STREQ(s->ToModifiedUtf8().c_str(), kResolvedString);
-    EXPECT_EQ(s.Ptr(), h_dex_cache->GetResolvedString(string_idx));
+    EXPECT_OBJ_PTR_EQ(s, h_dex_cache->GetResolvedString(string_idx));
   }
   Runtime::Current()->RollbackAndExitTransactionMode();
   // Check that the string did not stay resolved.

@@ -34,11 +34,6 @@ namespace debug {
 
 typedef std::vector<DexFile::PositionInfo> PositionInfos;
 
-static bool PositionInfoCallback(void* ctx, const DexFile::PositionInfo& entry) {
-  static_cast<PositionInfos*>(ctx)->push_back(entry);
-  return false;
-}
-
 template<typename ElfTypes>
 class ElfDebugLineWriter {
   using Elf_Addr = typename ElfTypes::Addr;
@@ -100,15 +95,12 @@ class ElfDebugLineWriter {
       if (mi->code_info != nullptr) {
         // Use stack maps to create mapping table from pc to dex.
         const CodeInfo code_info(mi->code_info);
-        const CodeInfoEncoding encoding = code_info.ExtractEncoding();
-        pc2dex_map.reserve(code_info.GetNumberOfStackMaps(encoding));
-        for (uint32_t s = 0; s < code_info.GetNumberOfStackMaps(encoding); s++) {
-          StackMap stack_map = code_info.GetStackMapAt(s, encoding);
-          DCHECK(stack_map.IsValid());
-          const uint32_t pc = stack_map.GetNativePcOffset(encoding.stack_map.encoding, isa);
-          const int32_t dex = stack_map.GetDexPc(encoding.stack_map.encoding);
+        pc2dex_map.reserve(code_info.GetNumberOfStackMaps());
+        for (StackMap stack_map : code_info.GetStackMaps()) {
+          const uint32_t pc = stack_map.GetNativePcOffset(isa);
+          const int32_t dex = stack_map.GetDexPc();
           pc2dex_map.push_back({pc, dex});
-          if (stack_map.HasDexRegisterMap(encoding.stack_map.encoding)) {
+          if (stack_map.HasDexRegisterMap()) {
             // Guess that the first map with local variables is the end of prologue.
             prologue_end = std::min(prologue_end, pc);
           }
@@ -157,11 +149,14 @@ class ElfDebugLineWriter {
       Elf_Addr method_address = base_address + mi->code_address;
 
       PositionInfos dex2line_map;
-      DCHECK(mi->dex_file != nullptr);
       const DexFile* dex = mi->dex_file;
+      DCHECK(dex != nullptr);
       CodeItemDebugInfoAccessor accessor(*dex, mi->code_item, mi->dex_method_index);
-      const uint32_t debug_info_offset = accessor.DebugInfoOffset();
-      if (!dex->DecodeDebugPositionInfo(debug_info_offset, PositionInfoCallback, &dex2line_map)) {
+      if (!accessor.DecodeDebugPositionInfo(
+          [&](const DexFile::PositionInfo& entry) {
+            dex2line_map.push_back(entry);
+            return false;
+          })) {
         continue;
       }
 

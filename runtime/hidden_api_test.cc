@@ -17,7 +17,7 @@
 #include "hidden_api.h"
 
 #include "common_runtime_test.h"
-#include "jni_internal.h"
+#include "jni/jni_internal.h"
 #include "proxy_test.h"
 
 namespace art {
@@ -27,7 +27,7 @@ using hiddenapi::GetActionFromAccessFlags;
 
 class HiddenApiTest : public CommonRuntimeTest {
  protected:
-  void SetUp() OVERRIDE {
+  void SetUp() override {
     // Do the normal setup.
     CommonRuntimeTest::SetUp();
     self_ = Thread::Current();
@@ -89,39 +89,39 @@ class HiddenApiTest : public CommonRuntimeTest {
 
 TEST_F(HiddenApiTest, CheckGetActionFromRuntimeFlags) {
   runtime_->SetHiddenApiEnforcementPolicy(hiddenapi::EnforcementPolicy::kNoChecks);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kWhitelist), hiddenapi::kAllow);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kLightGreylist), hiddenapi::kAllow);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kDarkGreylist), hiddenapi::kAllow);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kBlacklist), hiddenapi::kAllow);
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kWhitelist), hiddenapi::kAllow);
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kLightGreylist), hiddenapi::kAllow);
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kDarkGreylist), hiddenapi::kAllow);
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kBlacklist), hiddenapi::kAllow);
 
   runtime_->SetHiddenApiEnforcementPolicy(hiddenapi::EnforcementPolicy::kJustWarn);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kWhitelist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kWhitelist),
             hiddenapi::kAllow);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kLightGreylist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kLightGreylist),
             hiddenapi::kAllowButWarn);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kDarkGreylist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kDarkGreylist),
             hiddenapi::kAllowButWarn);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kBlacklist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kBlacklist),
             hiddenapi::kAllowButWarn);
 
   runtime_->SetHiddenApiEnforcementPolicy(hiddenapi::EnforcementPolicy::kDarkGreyAndBlackList);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kWhitelist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kWhitelist),
             hiddenapi::kAllow);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kLightGreylist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kLightGreylist),
             hiddenapi::kAllowButWarn);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kDarkGreylist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kDarkGreylist),
             hiddenapi::kDeny);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kBlacklist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kBlacklist),
             hiddenapi::kDeny);
 
   runtime_->SetHiddenApiEnforcementPolicy(hiddenapi::EnforcementPolicy::kBlacklistOnly);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kWhitelist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kWhitelist),
             hiddenapi::kAllow);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kLightGreylist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kLightGreylist),
             hiddenapi::kAllowButWarn);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kDarkGreylist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kDarkGreylist),
             hiddenapi::kAllowButWarnAndToast);
-  ASSERT_EQ(GetActionFromAccessFlags(HiddenApiAccessFlags::kBlacklist),
+  ASSERT_EQ(GetActionFromAccessFlags(hiddenapi::ApiList::kBlacklist),
             hiddenapi::kDeny);
 }
 
@@ -325,8 +325,8 @@ TEST_F(HiddenApiTest, CheckMemberSignatureForProxyClass) {
   ASSERT_TRUE(h_iface != nullptr);
 
   // Create the proxy class.
-  std::vector<mirror::Class*> interfaces;
-  interfaces.push_back(h_iface.Get());
+  std::vector<Handle<mirror::Class>> interfaces;
+  interfaces.push_back(h_iface);
   Handle<mirror::Class> proxyClass = hs.NewHandle(proxy_test::GenerateProxyClass(
       soa, jclass_loader_, runtime_->GetClassLinker(), "$Proxy1234", interfaces));
   ASSERT_TRUE(proxyClass != nullptr);

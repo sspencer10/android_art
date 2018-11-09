@@ -32,6 +32,7 @@ extern "C" void android_set_application_target_sdk_version(uint32_t version);
 #include "class_linker-inl.h"
 #include "common_throws.h"
 #include "debugger.h"
+#include "dex/class_accessor-inl.h"
 #include "dex/dex_file-inl.h"
 #include "dex/dex_file_types.h"
 #include "gc/accounting/card_table-inl.h"
@@ -41,8 +42,9 @@ extern "C" void android_set_application_target_sdk_version(uint32_t version);
 #include "gc/space/image_space.h"
 #include "gc/task_processor.h"
 #include "intern_table.h"
-#include "java_vm_ext.h"
-#include "jni_internal.h"
+#include "jni/java_vm_ext.h"
+#include "jni/jni_internal.h"
+#include "mirror/array-alloc-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/dex_cache-inl.h"
 #include "mirror/object-inl.h"
@@ -72,10 +74,6 @@ static void VMRuntime_startJitCompilation(JNIEnv*, jobject) {
 }
 
 static void VMRuntime_disableJitCompilation(JNIEnv*, jobject) {
-}
-
-static jboolean VMRuntime_hasUsedHiddenApi(JNIEnv*, jobject) {
-  return Runtime::Current()->HasPendingHiddenApiWarning() ? JNI_TRUE : JNI_FALSE;
 }
 
 static void VMRuntime_setHiddenApiExemptions(JNIEnv* env,
@@ -111,7 +109,7 @@ static jobject VMRuntime_newNonMovableArray(JNIEnv* env, jobject, jclass javaEle
   }
   Runtime* runtime = Runtime::Current();
   ObjPtr<mirror::Class> array_class =
-      runtime->GetClassLinker()->FindArrayClass(soa.Self(), &element_class);
+      runtime->GetClassLinker()->FindArrayClass(soa.Self(), element_class);
   if (UNLIKELY(array_class == nullptr)) {
     return nullptr;
   }
@@ -138,7 +136,7 @@ static jobject VMRuntime_newUnpaddedArray(JNIEnv* env, jobject, jclass javaEleme
   }
   Runtime* runtime = Runtime::Current();
   ObjPtr<mirror::Class> array_class = runtime->GetClassLinker()->FindArrayClass(soa.Self(),
-                                                                                &element_class);
+                                                                                element_class);
   if (UNLIKELY(array_class == nullptr)) {
     return nullptr;
   }
@@ -324,14 +322,14 @@ static void VMRuntime_runHeapTasks(JNIEnv* env, jobject) {
   Runtime::Current()->GetHeap()->GetTaskProcessor()->RunAllTasks(ThreadForEnv(env));
 }
 
-typedef std::map<std::string, ObjPtr<mirror::String>> StringTable;
+using StringTable = std::map<std::string, ObjPtr<mirror::String>>;
 
 class PreloadDexCachesStringsVisitor : public SingleRootVisitor {
  public:
   explicit PreloadDexCachesStringsVisitor(StringTable* table) : table_(table) { }
 
   void VisitRoot(mirror::Object* root, const RootInfo& info ATTRIBUTE_UNUSED)
-      OVERRIDE REQUIRES_SHARED(Locks::mutator_lock_) {
+      override REQUIRES_SHARED(Locks::mutator_lock_) {
     ObjPtr<mirror::String> string = root->AsString();
     table_->operator[](string->ToModifiedUtf8()) = string;
   }
@@ -373,7 +371,7 @@ static void PreloadDexCachesResolveType(Thread* self,
   const char* class_name = dex_file->StringByTypeIdx(type_idx);
   ClassLinker* linker = Runtime::Current()->GetClassLinker();
   ObjPtr<mirror::Class> klass = (class_name[1] == '\0')
-      ? linker->FindPrimitiveClass(class_name[0])
+      ? linker->LookupPrimitiveClass(class_name[0])
       : linker->LookupClass(self, class_name, nullptr);
   if (klass == nullptr) {
     return;
@@ -403,7 +401,7 @@ static void PreloadDexCachesResolveField(ObjPtr<mirror::DexCache> dex_cache,
   const DexFile* dex_file = dex_cache->GetDexFile();
   const DexFile::FieldId& field_id = dex_file->GetFieldId(field_idx);
   ObjPtr<mirror::Class> klass = Runtime::Current()->GetClassLinker()->LookupResolvedType(
-      field_id.class_idx_, dex_cache, /* class_loader */ nullptr);
+      field_id.class_idx_, dex_cache, /* class_loader= */ nullptr);
   if (klass == nullptr) {
     return;
   }
@@ -431,12 +429,12 @@ static void PreloadDexCachesResolveMethod(ObjPtr<mirror::DexCache> dex_cache, ui
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
 
   ObjPtr<mirror::Class> klass = class_linker->LookupResolvedType(
-      method_id.class_idx_, dex_cache, /* class_loader */ nullptr);
+      method_id.class_idx_, dex_cache, /* class_loader= */ nullptr);
   if (klass == nullptr) {
     return;
   }
   // Call FindResolvedMethod to populate the dex cache.
-  class_linker->FindResolvedMethod(klass, dex_cache, /* class_loader */ nullptr, method_idx);
+  class_linker->FindResolvedMethod(klass, dex_cache, /* class_loader= */ nullptr, method_idx);
 }
 
 struct DexCacheStats {
@@ -573,30 +571,12 @@ static void VMRuntime_preloadDexCaches(JNIEnv* env, jobject) {
     }
 
     if (kPreloadDexCachesFieldsAndMethods) {
-      for (size_t class_def_index = 0;
-           class_def_index < dex_file->NumClassDefs();
-           class_def_index++) {
-        const DexFile::ClassDef& class_def = dex_file->GetClassDef(class_def_index);
-        const uint8_t* class_data = dex_file->GetClassData(class_def);
-        if (class_data == nullptr) {
-          continue;
+      for (ClassAccessor accessor : dex_file->GetClasses()) {
+        for (const ClassAccessor::Field& field : accessor.GetFields()) {
+          PreloadDexCachesResolveField(dex_cache, field.GetIndex(), field.IsStatic());
         }
-        ClassDataItemIterator it(*dex_file, class_data);
-        for (; it.HasNextStaticField(); it.Next()) {
-          uint32_t field_idx = it.GetMemberIndex();
-          PreloadDexCachesResolveField(dex_cache, field_idx, true);
-        }
-        for (; it.HasNextInstanceField(); it.Next()) {
-          uint32_t field_idx = it.GetMemberIndex();
-          PreloadDexCachesResolveField(dex_cache, field_idx, false);
-        }
-        for (; it.HasNextDirectMethod(); it.Next()) {
-          uint32_t method_idx = it.GetMemberIndex();
-          PreloadDexCachesResolveMethod(dex_cache, method_idx);
-        }
-        for (; it.HasNextVirtualMethod(); it.Next()) {
-          uint32_t method_idx = it.GetMemberIndex();
-          PreloadDexCachesResolveMethod(dex_cache, method_idx);
+        for (const ClassAccessor::Method& method : accessor.GetMethods()) {
+          PreloadDexCachesResolveMethod(dex_cache, method.GetIndex());
         }
       }
     }
@@ -699,6 +679,11 @@ static void VMRuntime_setProcessPackageName(JNIEnv* env,
   Runtime::Current()->SetProcessPackageName(package_name.c_str());
 }
 
+static jboolean VMRuntime_hasBootImageSpaces(JNIEnv* env ATTRIBUTE_UNUSED,
+                                             jclass klass ATTRIBUTE_UNUSED) {
+  return Runtime::Current()->GetHeap()->HasBootImageSpace() ? JNI_TRUE : JNI_FALSE;
+}
+
 static JNINativeMethod gMethods[] = {
   FAST_NATIVE_METHOD(VMRuntime, addressOf, "(Ljava/lang/Object;)J"),
   NATIVE_METHOD(VMRuntime, bootClassPath, "()Ljava/lang/String;"),
@@ -707,7 +692,7 @@ static JNINativeMethod gMethods[] = {
   NATIVE_METHOD(VMRuntime, clearGrowthLimit, "()V"),
   NATIVE_METHOD(VMRuntime, concurrentGC, "()V"),
   NATIVE_METHOD(VMRuntime, disableJitCompilation, "()V"),
-  NATIVE_METHOD(VMRuntime, hasUsedHiddenApi, "()Z"),
+  FAST_NATIVE_METHOD(VMRuntime, hasBootImageSpaces, "()Z"),  // Could be CRITICAL.
   NATIVE_METHOD(VMRuntime, setHiddenApiExemptions, "([Ljava/lang/String;)V"),
   NATIVE_METHOD(VMRuntime, setHiddenApiAccessLogSamplingRate, "(I)V"),
   NATIVE_METHOD(VMRuntime, getTargetHeapUtilization, "()F"),

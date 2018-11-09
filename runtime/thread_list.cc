@@ -40,7 +40,7 @@
 #include "gc/heap.h"
 #include "gc/reference_processor.h"
 #include "gc_root.h"
-#include "jni_internal.h"
+#include "jni/jni_internal.h"
 #include "lock_word.h"
 #include "monitor.h"
 #include "native_stack_dump.h"
@@ -199,7 +199,7 @@ void ThreadList::DumpUnattachedThreads(std::ostream& os, bool dump_native_stack)
 static constexpr uint32_t kDumpWaitTimeout = kIsTargetBuild ? 100000 : 20000;
 
 // A closure used by Thread::Dump.
-class DumpCheckpoint FINAL : public Closure {
+class DumpCheckpoint final : public Closure {
  public:
   DumpCheckpoint(std::ostream* os, bool dump_native_stack)
       : os_(os),
@@ -211,7 +211,7 @@ class DumpCheckpoint FINAL : public Closure {
     }
   }
 
-  void Run(Thread* thread) OVERRIDE {
+  void Run(Thread* thread) override {
     // Note thread and self may not be equal if thread was already suspended at the point of the
     // request.
     Thread* self = Thread::Current();
@@ -438,7 +438,7 @@ void ThreadList::RunEmptyCheckpoint() {
   // Wake up the threads blocking for weak ref access so that they will respond to the empty
   // checkpoint request. Otherwise we will hang as they are blocking in the kRunnable state.
   Runtime::Current()->GetHeap()->GetReferenceProcessor()->BroadcastForSlowPath(self);
-  Runtime::Current()->BroadcastForNewSystemWeaks(/*broadcast_for_checkpoint*/true);
+  Runtime::Current()->BroadcastForNewSystemWeaks(/*broadcast_for_checkpoint=*/true);
   {
     ScopedThreadStateChange tsc(self, kWaitingForCheckPointsToRun);
     uint64_t total_wait_time = 0;
@@ -491,9 +491,9 @@ void ThreadList::RunEmptyCheckpoint() {
               // Found a runnable thread that hasn't responded to the empty checkpoint request.
               // Assume it's stuck and safe to dump its stack.
               thread->Dump(LOG_STREAM(FATAL_WITHOUT_ABORT),
-                           /*dump_native_stack*/ true,
-                           /*backtrace_map*/ nullptr,
-                           /*force_dump_stack*/ true);
+                           /*dump_native_stack=*/ true,
+                           /*backtrace_map=*/ nullptr,
+                           /*force_dump_stack=*/ true);
             }
           }
         }
@@ -732,7 +732,7 @@ void ThreadList::SuspendAllInternal(Thread* self,
     if (reason == SuspendReason::kForDebugger) {
       ++debug_suspend_all_count_;
     }
-    pending_threads.StoreRelaxed(list_.size() - num_ignored);
+    pending_threads.store(list_.size() - num_ignored, std::memory_order_relaxed);
     // Increment everybody's suspend count (except those that should be ignored).
     for (const auto& thread : list_) {
       if (thread == ignore1 || thread == ignore2) {
@@ -748,7 +748,7 @@ void ThreadList::SuspendAllInternal(Thread* self,
       if (thread->IsSuspended()) {
         // Only clear the counter for the current thread.
         thread->ClearSuspendBarrier(&pending_threads);
-        pending_threads.FetchAndSubSequentiallyConsistent(1);
+        pending_threads.fetch_sub(1, std::memory_order_seq_cst);
       }
     }
   }
@@ -761,10 +761,11 @@ void ThreadList::SuspendAllInternal(Thread* self,
 #endif
   const uint64_t start_time = NanoTime();
   while (true) {
-    int32_t cur_val = pending_threads.LoadRelaxed();
+    int32_t cur_val = pending_threads.load(std::memory_order_relaxed);
     if (LIKELY(cur_val > 0)) {
 #if ART_USE_FUTEXES
-      if (futex(pending_threads.Address(), FUTEX_WAIT, cur_val, &wait_timeout, nullptr, 0) != 0) {
+      if (futex(pending_threads.Address(), FUTEX_WAIT_PRIVATE, cur_val, &wait_timeout, nullptr, 0)
+          != 0) {
         // EAGAIN and EINTR both indicate a spurious failure, try again from the beginning.
         if ((errno != EAGAIN) && (errno != EINTR)) {
           if (errno == ETIMEDOUT) {
@@ -1431,6 +1432,7 @@ void ThreadList::Register(Thread* self) {
     }
     self->SetWeakRefAccessEnabled(cc->IsWeakRefAccessEnabled());
   }
+  self->NotifyInTheadList();
 }
 
 void ThreadList::Unregister(Thread* self) {
@@ -1474,6 +1476,9 @@ void ThreadList::Unregister(Thread* self) {
         list_.remove(self);
         break;
       }
+      // In the case where we are not suspended yet, sleep to leave other threads time to execute.
+      // This is important if there are realtime threads. b/111277984
+      usleep(1);
     }
     // We failed to remove the thread due to a suspend request, loop and try again.
   }

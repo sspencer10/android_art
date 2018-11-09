@@ -20,9 +20,9 @@
 #include <ostream>
 #include <type_traits>
 
+#include "base/globals.h"
 #include "base/macros.h"
 #include "base/mutex.h"  // For Locks::mutator_lock_.
-#include "globals.h"
 
 namespace art {
 
@@ -156,9 +156,7 @@ class ObjPtr {
 
  private:
   // Trim off high bits of thread local cookie.
-  ALWAYS_INLINE static uintptr_t TrimCookie(uintptr_t cookie) {
-    return cookie & kCookieMask;
-  }
+  ALWAYS_INLINE static uintptr_t GetCurrentTrimedCookie();
 
   ALWAYS_INLINE uintptr_t GetCookie() const {
     return reference_ >> kCookieShift;

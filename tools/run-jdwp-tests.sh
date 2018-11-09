@@ -19,6 +19,16 @@ if [ ! -d libcore ]; then
   exit 1
 fi
 
+# Prevent JDWP tests from running on the following devices running
+# Android O (they are failing because of a network-related issue), as
+# a workaround for b/74725685:
+# - FA7BN1A04406 (walleye device testing configuration aosp-poison/volantis-armv7-poison-debug)
+# - FA7BN1A04412 (walleye device testing configuration aosp-poison/volantis-armv8-poison-ndebug)
+# - FA7BN1A04433 (walleye device testing configuration aosp-poison/volantis-armv8-poison-debug)
+case "$ANDROID_SERIAL" in
+  (FA7BN1A04406|FA7BN1A04412|FA7BN1A04433) exit 0;;
+esac
+
 source build/envsetup.sh >&/dev/null # for get_build_var, setpaths
 setpaths # include platform prebuilt java, javac, etc in $PATH.
 
@@ -26,13 +36,18 @@ if [ -z "$ANDROID_HOST_OUT" ] ; then
   ANDROID_HOST_OUT=${OUT_DIR-$ANDROID_BUILD_TOP/out}/host/linux-x86
 fi
 
+# "Root" (actually "system") directory on device (in the case of
+# target testing).
+android_root=${ART_TEST_ANDROID_ROOT:-/system}
+
 java_lib_location="${ANDROID_HOST_OUT}/../common/obj/JAVA_LIBRARIES"
 make_target_name="apache-harmony-jdwp-tests-hostdex"
 
 vm_args=""
-art="/data/local/tmp/system/bin/art"
-art_debugee="sh /data/local/tmp/system/bin/art"
+art="$android_root/bin/art"
+art_debugee="sh $android_root/bin/art"
 args=$@
+chroot_option=
 debuggee_args="-Xcompiler-option --debuggable"
 device_dir="--device-dir=/data/local/tmp"
 # We use the art script on target to ensure the runner and the debuggee share the same
@@ -53,6 +68,7 @@ test="org.apache.harmony.jpda.tests.share.AllTests"
 mode="target"
 # Use JIT compiling by default.
 use_jit=true
+instant_jit=false
 variant_cmdline_parameter="--variant=X32"
 dump_command="/bin/true"
 # Timeout of JDWP test in ms.
@@ -113,6 +129,11 @@ while true; do
     shift
   elif [[ $1 == -Ximage:* ]]; then
     image="$1"
+    shift
+  elif [[ "$1" == "--instant-jit" ]]; then
+    instant_jit=true
+    # Remove the --instant-jit from the arguments.
+    args=${args/$1}
     shift
   elif [[ "$1" == "--no-jit" ]]; then
     use_jit=false
@@ -176,6 +197,19 @@ while true; do
   fi
 done
 
+if [[ $mode == "target" ]]; then
+  # Honor environment variable ART_TEST_CHROOT.
+  if [[ -n "$ART_TEST_CHROOT" ]]; then
+    # Set Vogar's `--chroot` option.
+    chroot_option="--chroot $ART_TEST_CHROOT"
+    # Adjust settings for chroot environment.
+    art="/system/bin/art"
+    art_debugee="sh /system/bin/art"
+    vm_command="--vm-command=$art"
+    device_dir="--device-dir=/tmp"
+  fi
+fi
+
 if [[ $has_gdb = "yes" ]]; then
   if [[ $explicit_debug = "no" ]]; then
     debug="yes"
@@ -201,10 +235,11 @@ else
   if [[ "$mode" == "host" ]]; then
     dump_command="/bin/kill -3"
   else
-    # TODO It would be great to be able to use this on target too but we need to
-    # be able to walk /proc to figure out what the actual child pid is.
-    dump_command="/system/bin/true"
-    # dump_command="/system/xbin/su root /data/local/tmp/system/bin/debuggerd -b"
+    # Note that this dumping command won't work when `$android_root`
+    # is different from `/system` (e.g. on ART Buildbot devices) when
+    # the device is running Android N, as the debuggerd protocol
+    # changed in an incompatible way in Android O (see b/32466479).
+    dump_command="$android_root/xbin/su root $android_root/bin/debuggerd"
   fi
   if [[ $has_gdb = "yes" ]]; then
     if [[ $mode == "target" ]]; then
@@ -222,8 +257,11 @@ else
     vm_args="${vm_args} --vm-arg -Djpda.settings.debuggeeAgentName=${with_jdwp_path}"
   fi
   vm_args="$vm_args --vm-arg -Xcompiler-option --vm-arg --debuggable"
-  # Make sure the debuggee doesn't clean up what the debugger has generated.
-  art_debugee="$art_debugee --no-clean"
+  # we don't want to be trying to connect to adbconnection which might not have
+  # been built.
+  vm_args="${vm_args} --vm-arg -XjdwpProvider:none"
+  # Make sure the debuggee doesn't re-generate, nor clean up what the debugger has generated.
+  art_debugee="$art_debugee --no-compile --no-clean"
 fi
 
 function jlib_name {
@@ -273,12 +311,16 @@ if [[ "$plugin" != "" ]]; then
   vm_args="$vm_args --vm-arg $plugin"
 fi
 
-if $use_jit; then
+if [[ $mode != "ri" ]]; then
+  # Because we're running debuggable, we discard any AOT code.
+  # Therefore we run de2oat with 'quicken' to avoid spending time compiling.
   vm_args="$vm_args --vm-arg -Xcompiler-option --vm-arg --compiler-filter=quicken"
   debuggee_args="$debuggee_args -Xcompiler-option --compiler-filter=quicken"
-fi
 
-if [[ $mode != "ri" ]]; then
+  if $instant_jit; then
+    debuggee_args="$debuggee_args -Xjitthreshold:0"
+  fi
+
   vm_args="$vm_args --vm-arg -Xusejit:$use_jit"
   debuggee_args="$debuggee_args -Xusejit:$use_jit"
 fi
@@ -298,6 +340,10 @@ if [[ $mode != "ri" ]]; then
   if [[ "x$with_jdwp_path" == "x" ]]; then
     # Need to enable the internal jdwp implementation.
     art_debugee="${art_debugee} -XjdwpProvider:internal"
+  else
+    # need to disable the jdwpProvider since we give the agent explicitly on the
+    # cmdline.
+    art_debugee="${art_debugee} -XjdwpProvider:none"
   fi
 else
   toolchain_args="--toolchain javac --language CUR"
@@ -308,6 +354,7 @@ vogar $vm_command \
       $vm_args \
       --verbose \
       $args \
+      $chroot_option \
       $device_dir \
       $image_compiler_option \
       --timeout 800 \
@@ -327,7 +374,9 @@ echo "Killing stalled dalvikvm processes..."
 if [[ $mode == "host" ]]; then
   pkill -9 -f /bin/dalvikvm
 else
-  adb shell pkill -9 -f /bin/dalvikvm
+  # Tests may run on older Android versions where pkill requires "-l SIGNAL"
+  # rather than "-SIGNAL".
+  adb shell pkill -l 9 -f /bin/dalvikvm
 fi
 echo "Done."
 

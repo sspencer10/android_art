@@ -19,7 +19,6 @@
 #include <stdlib.h>
 #include <sys/file.h>
 #include <sys/param.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <fstream>
@@ -34,24 +33,25 @@
 
 #include "base/dumpable.h"
 #include "base/logging.h"  // For InitLogging.
-#include "base/mutex.h"
+#include "base/mem_map.h"
 #include "base/scoped_flock.h"
+#include "base/stl_util.h"
 #include "base/stringpiece.h"
 #include "base/time_utils.h"
 #include "base/unix_file/fd_file.h"
 #include "base/utils.h"
+#include "base/zip_archive.h"
 #include "boot_image_profile.h"
 #include "dex/art_dex_file_loader.h"
 #include "dex/bytecode_utils.h"
+#include "dex/class_accessor-inl.h"
 #include "dex/code_item_accessors-inl.h"
 #include "dex/dex_file.h"
 #include "dex/dex_file_loader.h"
 #include "dex/dex_file_types.h"
 #include "dex/type_reference.h"
-#include "jit/profile_compilation_info.h"
+#include "profile/profile_compilation_info.h"
 #include "profile_assistant.h"
-#include "runtime.h"
-#include "zip_archive.h"
 
 namespace art {
 
@@ -179,9 +179,14 @@ static constexpr char kMethodFlagStringHot = 'H';
 static constexpr char kMethodFlagStringStartup = 'S';
 static constexpr char kMethodFlagStringPostStartup = 'P';
 
+NO_RETURN static void Abort(const char* msg) {
+  LOG(ERROR) << msg;
+  exit(1);
+}
+
 // TODO(calin): This class has grown too much from its initial design. Split the functionality
 // into smaller, more contained pieces.
-class ProfMan FINAL {
+class ProfMan final {
  public:
   ProfMan() :
       reference_profile_file_fd_(kInvalidFd),
@@ -204,8 +209,8 @@ class ProfMan FINAL {
     original_argc = argc;
     original_argv = argv;
 
-    Locks::Init();
-    InitLogging(argv, Runtime::Abort);
+    MemMap::Init();
+    InitLogging(argv, Abort);
 
     // Skip over the command name.
     argv++;
@@ -385,7 +390,7 @@ class ProfMan FINAL {
   }
 
   bool OpenApkFilesFromLocations(
-      std::function<void(std::unique_ptr<const DexFile>&&)> process_fn) {
+      const std::function<void(std::unique_ptr<const DexFile>&&)>& process_fn) {
     bool use_apk_fd_list = !apks_fd_.empty();
     if (use_apk_fd_list) {
       // Get the APKs from the collection of FDs.
@@ -422,7 +427,7 @@ class ProfMan FINAL {
       if (use_apk_fd_list) {
         if (dex_file_loader.OpenZip(apks_fd_[i],
                                     dex_locations_[i],
-                                    /* verify */ false,
+                                    /* verify= */ false,
                                     kVerifyChecksum,
                                     &error_msg,
                                     &dex_files_for_location)) {
@@ -433,7 +438,7 @@ class ProfMan FINAL {
       } else {
         if (dex_file_loader.Open(apk_files_[i].c_str(),
                                  dex_locations_[i],
-                                 /* verify */ false,
+                                 /* verify= */ false,
                                  kVerifyChecksum,
                                  &error_msg,
                                  &dex_files_for_location)) {
@@ -472,7 +477,7 @@ class ProfMan FINAL {
 
   std::unique_ptr<const ProfileCompilationInfo> LoadProfile(const std::string& filename, int fd) {
     if (!filename.empty()) {
-      fd = open(filename.c_str(), O_RDWR);
+      fd = open(filename.c_str(), O_RDWR | O_CLOEXEC);
       if (fd < 0) {
         LOG(ERROR) << "Cannot open " << filename << strerror(errno);
         return nullptr;
@@ -496,7 +501,7 @@ class ProfMan FINAL {
       LOG(ERROR) << "Cannot load profile info from filename=" << filename << " fd=" << fd;
       return -1;
     }
-    *dump += banner + "\n" + info->DumpInfo(dex_files) + "\n";
+    *dump += banner + "\n" + info->DumpInfo(MakeNonOwningPointerVector(*dex_files)) + "\n";
     return 0;
   }
 
@@ -509,10 +514,23 @@ class ProfMan FINAL {
     static const char* kEmptyString = "";
     static const char* kOrdinaryProfile = "=== profile ===";
     static const char* kReferenceProfile = "=== reference profile ===";
+    static const char* kDexFiles = "=== Dex files  ===";
 
     std::vector<std::unique_ptr<const DexFile>> dex_files;
     OpenApkFilesFromLocations(&dex_files);
+
     std::string dump;
+
+    // Dump checkfiles and corresponding checksums.
+    dump += kDexFiles;
+    dump += "\n";
+    for (const std::unique_ptr<const DexFile>& dex_file : dex_files) {
+      std::ostringstream oss;
+      oss << dex_file->GetLocation()
+          << " [checksum=" << std::hex << dex_file->GetLocationChecksum() << "]\n";
+      dump += oss.str();
+    }
+
     // Dump individual profile files.
     if (!profile_files_fd_.empty()) {
       for (int profile_file_fd : profile_files_fd_) {
@@ -526,12 +544,10 @@ class ProfMan FINAL {
         }
       }
     }
-    if (!profile_files_.empty()) {
-      for (const std::string& profile_file : profile_files_) {
-        int ret = DumpOneProfile(kOrdinaryProfile, profile_file, kInvalidFd, &dex_files, &dump);
-        if (ret != 0) {
-          return ret;
-        }
+    for (const std::string& profile_file : profile_files_) {
+      int ret = DumpOneProfile(kOrdinaryProfile, profile_file, kInvalidFd, &dex_files, &dump);
+      if (ret != 0) {
+        return ret;
       }
     }
     // Dump reference profile file.
@@ -558,7 +574,7 @@ class ProfMan FINAL {
     if (!FdIsValid(dump_output_to_fd_)) {
       std::cout << dump;
     } else {
-      unix_file::FdFile out_fd(dump_output_to_fd_, false /*check_usage*/);
+      unix_file::FdFile out_fd(dump_output_to_fd_, /*check_usage=*/ false);
       if (!out_fd.WriteFully(dump.c_str(), dump.length())) {
         return -1;
       }
@@ -625,7 +641,7 @@ class ProfMan FINAL {
   bool GetClassNamesAndMethods(const std::string& profile_file,
                                std::vector<std::unique_ptr<const DexFile>>* dex_files,
                                std::set<std::string>* out_lines) {
-    int fd = open(profile_file.c_str(), O_RDONLY);
+    int fd = open(profile_file.c_str(), O_RDONLY | O_CLOEXEC);
     if (!FdIsValid(fd)) {
       LOG(ERROR) << "Cannot open " << profile_file << strerror(errno);
       return false;
@@ -684,7 +700,7 @@ class ProfMan FINAL {
     if (!FdIsValid(dump_output_to_fd_)) {
       std::cout << dump;
     } else {
-      unix_file::FdFile out_fd(dump_output_to_fd_, false /*check_usage*/);
+      unix_file::FdFile out_fd(dump_output_to_fd_, /*check_usage=*/ false);
       if (!out_fd.WriteFully(dump.c_str(), dump.length())) {
         return -1;
       }
@@ -836,7 +852,8 @@ class ProfMan FINAL {
 
     bool found_invoke = false;
     for (const DexInstructionPcPair& inst : CodeItemInstructionAccessor(*dex_file, code_item)) {
-      if (inst->Opcode() == Instruction::INVOKE_VIRTUAL) {
+      if (inst->Opcode() == Instruction::INVOKE_VIRTUAL ||
+          inst->Opcode() == Instruction::INVOKE_VIRTUAL_RANGE) {
         if (found_invoke) {
           LOG(ERROR) << "Multiple invoke INVOKE_VIRTUAL found: "
                      << dex_file->PrettyMethod(method_index);
@@ -907,7 +924,7 @@ class ProfMan FINAL {
       flags |= ProfileCompilationInfo::MethodHotness::kFlagPostStartup;
     }
 
-    TypeReference class_ref(/* dex_file */ nullptr, dex::TypeIndex());
+    TypeReference class_ref(/* dex_file= */ nullptr, dex::TypeIndex());
     if (!FindClass(dex_files, klass, &class_ref)) {
       LOG(WARNING) << "Could not find class: " << klass;
       return false;
@@ -925,19 +942,13 @@ class ProfMan FINAL {
       dex_resolved_classes.first->AddClass(class_ref.TypeIndex());
       std::vector<ProfileMethodInfo> methods;
       if (method_str == kClassAllMethods) {
-        // Add all of the methods.
-        const DexFile::ClassDef* class_def = dex_file->FindClassDef(class_ref.TypeIndex());
-        const uint8_t* class_data = dex_file->GetClassData(*class_def);
-        if (class_data != nullptr) {
-          ClassDataItemIterator it(*dex_file, class_data);
-          it.SkipAllFields();
-          while (it.HasNextMethod()) {
-            if (it.GetMethodCodeItemOffset() != 0) {
-              // Add all of the methods that have code to the profile.
-              const uint32_t method_idx = it.GetMemberIndex();
-              methods.push_back(ProfileMethodInfo(MethodReference(dex_file, method_idx)));
-            }
-            it.Next();
+        ClassAccessor accessor(
+            *dex_file,
+            dex_file->GetIndexForClassDef(*dex_file->FindClassDef(class_ref.TypeIndex())));
+        for (const ClassAccessor::Method& method : accessor.GetMethods()) {
+          if (method.GetCodeItemOffset() != 0) {
+            // Add all of the methods that have code to the profile.
+            methods.push_back(ProfileMethodInfo(method.GetReference()));
           }
         }
       }
@@ -982,7 +993,7 @@ class ProfMan FINAL {
         return false;
       }
       std::vector<TypeReference> classes(inline_cache_elems.size(),
-                                         TypeReference(/* dex_file */ nullptr, dex::TypeIndex()));
+                                         TypeReference(/* dex_file= */ nullptr, dex::TypeIndex()));
       size_t class_it = 0;
       for (const std::string& ic_class : inline_cache_elems) {
         if (!FindClass(dex_files, ic_class, &(classes[class_it++]))) {
@@ -1011,7 +1022,7 @@ class ProfMan FINAL {
     int fd = reference_profile_file_fd_;
     if (!FdIsValid(fd)) {
       CHECK(!reference_profile_file_.empty());
-      fd = open(reference_profile_file_.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+      fd = open(reference_profile_file_.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
       if (fd < 0) {
         LOG(ERROR) << "Cannot open " << reference_profile_file_ << strerror(errno);
         return kInvalidFd;
@@ -1144,7 +1155,9 @@ class ProfMan FINAL {
       }
     }
     // ShouldGenerateTestProfile confirms !test_profile_.empty().
-    int profile_test_fd = open(test_profile_.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    int profile_test_fd = open(test_profile_.c_str(),
+                               O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC,
+                               0644);
     if (profile_test_fd < 0) {
       LOG(ERROR) << "Cannot open " << test_profile_ << strerror(errno);
       return -1;
@@ -1202,7 +1215,7 @@ class ProfMan FINAL {
     // Do not clear if invalid. The input might be an archive.
     bool load_ok = use_fds
         ? profile.Load(profile_files_fd_[0])
-        : profile.Load(profile_files_[0], /*clear_if_invalid*/ false);
+        : profile.Load(profile_files_[0], /*clear_if_invalid=*/ false);
     if (load_ok) {
       // Open the dex files to look up classes and methods.
       std::vector<std::unique_ptr<const DexFile>> dex_files;
@@ -1212,7 +1225,7 @@ class ProfMan FINAL {
       }
       bool result = use_fds
           ? profile.Save(reference_profile_file_fd_)
-          : profile.Save(reference_profile_file_, /*bytes_written*/ nullptr);
+          : profile.Save(reference_profile_file_, /*bytes_written=*/ nullptr);
       return result ? 0 : kErrorFailedToSaveProfile;
     } else {
       return kErrorFailedToLoadProfile;
@@ -1308,4 +1321,3 @@ static int profman(int argc, char** argv) {
 int main(int argc, char **argv) {
   return art::profman(argc, argv);
 }
-

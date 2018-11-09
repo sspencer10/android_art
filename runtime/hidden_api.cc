@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include <metricslogger/metrics_logger.h>
-
 #include "hidden_api.h"
 
 #include <nativehelper/scoped_local_ref.h>
@@ -24,11 +22,14 @@
 #include "thread-current-inl.h"
 #include "well_known_classes.h"
 
+#ifdef ART_TARGET_ANDROID
+#include <metricslogger/metrics_logger.h>
 using android::metricslogger::ComplexEventLogger;
 using android::metricslogger::ACTION_HIDDEN_API_ACCESSED;
 using android::metricslogger::FIELD_HIDDEN_API_ACCESS_METHOD;
 using android::metricslogger::FIELD_HIDDEN_API_ACCESS_DENIED;
 using android::metricslogger::FIELD_HIDDEN_API_SIGNATURE;
+#endif
 
 namespace art {
 namespace hiddenapi {
@@ -59,14 +60,14 @@ static inline std::ostream& operator<<(std::ostream& os, AccessMethod value) {
   return os;
 }
 
-static constexpr bool EnumsEqual(EnforcementPolicy policy, HiddenApiAccessFlags::ApiList apiList) {
+static constexpr bool EnumsEqual(EnforcementPolicy policy, hiddenapi::ApiList apiList) {
   return static_cast<int>(policy) == static_cast<int>(apiList);
 }
 
 // GetMemberAction-related static_asserts.
 static_assert(
-    EnumsEqual(EnforcementPolicy::kDarkGreyAndBlackList, HiddenApiAccessFlags::kDarkGreylist) &&
-    EnumsEqual(EnforcementPolicy::kBlacklistOnly, HiddenApiAccessFlags::kBlacklist),
+    EnumsEqual(EnforcementPolicy::kDarkGreyAndBlackList, hiddenapi::ApiList::kDarkGreylist) &&
+    EnumsEqual(EnforcementPolicy::kBlacklistOnly, hiddenapi::ApiList::kBlacklist),
     "Mismatch between EnforcementPolicy and ApiList enums");
 static_assert(
     EnforcementPolicy::kJustWarn < EnforcementPolicy::kDarkGreyAndBlackList &&
@@ -132,11 +133,11 @@ void MemberSignature::Dump(std::ostream& os) const {
   }
 }
 
-void MemberSignature::WarnAboutAccess(AccessMethod access_method,
-                                      HiddenApiAccessFlags::ApiList list) {
+void MemberSignature::WarnAboutAccess(AccessMethod access_method, hiddenapi::ApiList list) {
   LOG(WARNING) << "Accessing hidden " << (type_ == kField ? "field " : "method ")
                << Dumpable<MemberSignature>(*this) << " (" << list << ", " << access_method << ")";
 }
+#ifdef ART_TARGET_ANDROID
 // Convert an AccessMethod enum to a value for logging from the proto enum.
 // This method may look odd (the enum values are current the same), but it
 // prevents coupling the internal enum to the proto enum (which should never
@@ -156,8 +157,10 @@ inline static int32_t GetEnumValueForLog(AccessMethod access_method) {
       DCHECK(false);
   }
 }
+#endif
 
 void MemberSignature::LogAccessToEventLog(AccessMethod access_method, Action action_taken) {
+#ifdef ART_TARGET_ANDROID
   if (access_method == kLinking || access_method == kNone) {
     // Linking warnings come from static analysis/compilation of the bytecode
     // and can contain false positives (i.e. code that is never run). We choose
@@ -178,6 +181,10 @@ void MemberSignature::LogAccessToEventLog(AccessMethod access_method, Action act
   Dump(signature_str);
   log_maker.AddTaggedData(FIELD_HIDDEN_API_SIGNATURE, signature_str.str());
   log_maker.Record();
+#else
+  UNUSED(access_method);
+  UNUSED(action_taken);
+#endif
 }
 
 static ALWAYS_INLINE bool CanUpdateMemberAccessFlags(ArtField*) {
@@ -192,14 +199,14 @@ template<typename T>
 static ALWAYS_INLINE void MaybeWhitelistMember(Runtime* runtime, T* member)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   if (CanUpdateMemberAccessFlags(member) && runtime->ShouldDedupeHiddenApiWarnings()) {
-    member->SetAccessFlags(HiddenApiAccessFlags::EncodeForRuntime(
-        member->GetAccessFlags(), HiddenApiAccessFlags::kWhitelist));
+    member->SetAccessFlags(hiddenapi::EncodeForRuntime(
+        member->GetAccessFlags(), hiddenapi::ApiList::kWhitelist));
   }
 }
 
 template<typename T>
 Action GetMemberActionImpl(T* member,
-                           HiddenApiAccessFlags::ApiList api_list,
+                           hiddenapi::ApiList api_list,
                            Action action,
                            AccessMethod access_method) {
   DCHECK_NE(action, kAllow);
@@ -233,7 +240,7 @@ Action GetMemberActionImpl(T* member,
     }
   }
 
-  if (kIsTargetBuild) {
+  if (kIsTargetBuild && !kIsTargetLinux) {
     uint32_t eventLogSampleRate = runtime->GetHiddenApiEventLogSampleRate();
     // Assert that RAND_MAX is big enough, to ensure sampling below works as expected.
     static_assert(RAND_MAX >= 0xffff, "RAND_MAX too small");
@@ -268,11 +275,11 @@ Action GetMemberActionImpl(T* member,
 
 // Need to instantiate this.
 template Action GetMemberActionImpl<ArtField>(ArtField* member,
-                                              HiddenApiAccessFlags::ApiList api_list,
+                                              hiddenapi::ApiList api_list,
                                               Action action,
                                               AccessMethod access_method);
 template Action GetMemberActionImpl<ArtMethod>(ArtMethod* member,
-                                               HiddenApiAccessFlags::ApiList api_list,
+                                               hiddenapi::ApiList api_list,
                                                Action action,
                                                AccessMethod access_method);
 }  // namespace detail

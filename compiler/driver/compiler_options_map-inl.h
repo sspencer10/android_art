@@ -43,9 +43,6 @@ inline bool ReadCompilerOptions(Base& map, CompilerOptions* options, std::string
     }
     options->SetCompilerFilter(compiler_filter);
   }
-  if (map.Exists(Base::PIC)) {
-    options->compile_pic_ = true;
-  }
   map.AssignIfExists(Base::HugeMethodMaxThreshold, &options->huge_method_threshold_);
   map.AssignIfExists(Base::LargeMethodMaxThreshold, &options->large_method_threshold_);
   map.AssignIfExists(Base::SmallMethodMaxThreshold, &options->small_method_threshold_);
@@ -57,6 +54,9 @@ inline bool ReadCompilerOptions(Base& map, CompilerOptions* options, std::string
   map.AssignIfExists(Base::GenerateBuildID, &options->generate_build_id_);
   if (map.Exists(Base::Debuggable)) {
     options->debuggable_ = true;
+  }
+  if (map.Exists(Base::Baseline)) {
+    options->baseline_ = true;
   }
   map.AssignIfExists(Base::TopKProfileThreshold, &options->top_k_profile_threshold_);
   map.AssignIfExists(Base::AbortOnHardVerifierFailure, &options->abort_on_hard_verifier_failure_);
@@ -80,9 +80,14 @@ inline bool ReadCompilerOptions(Base& map, CompilerOptions* options, std::string
   if (map.Exists(Base::CountHotnessInCompiledCode)) {
     options->count_hotness_in_compiled_code_ = true;
   }
+  map.AssignIfExists(Base::ResolveStartupConstStrings, &options->resolve_startup_const_strings_);
 
   if (map.Exists(Base::DumpTimings)) {
     options->dump_timings_ = true;
+  }
+
+  if (map.Exists(Base::DumpPassTimings)) {
+    options->dump_pass_timings_ = true;
   }
 
   if (map.Exists(Base::DumpStats)) {
@@ -101,9 +106,6 @@ inline void AddCompilerOptionsArgumentParserOptions(Builder& b) {
       Define("--compiler-filter=_")
           .template WithType<std::string>()
           .IntoKey(Map::CompilerFilter)
-
-      .Define("--compile-pic")
-          .IntoKey(Map::PIC)
 
       .Define("--huge-method-max=_")
           .template WithType<unsigned int>()
@@ -146,11 +148,17 @@ inline void AddCompilerOptionsArgumentParserOptions(Builder& b) {
       .Define({"--dump-timings"})
           .IntoKey(Map::DumpTimings)
 
+      .Define({"--dump-pass-timings"})
+          .IntoKey(Map::DumpPassTimings)
+
       .Define({"--dump-stats"})
           .IntoKey(Map::DumpStats)
 
       .Define("--debuggable")
           .IntoKey(Map::Debuggable)
+
+      .Define("--baseline")
+          .IntoKey(Map::Baseline)
 
       .Define("--top-k-profile-threshold=_")
           .template WithType<double>().WithRange(0.0, 100.0)
@@ -176,6 +184,11 @@ inline void AddCompilerOptionsArgumentParserOptions(Builder& b) {
       .Define("--register-allocation-strategy=_")
           .template WithType<std::string>()
           .IntoKey(Map::RegisterAllocationStrategy)
+
+      .Define("--resolve-startup-const-strings=_")
+          .template WithType<bool>()
+          .WithValueMap({{"false", false}, {"true", true}})
+          .IntoKey(Map::ResolveStartupConstStrings)
 
       .Define("--verbose-methods=_")
           .template WithType<ParseStringList<','>>()

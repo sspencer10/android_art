@@ -42,12 +42,6 @@ static constexpr uint32_t kAccEnum =         0x4000;  // class, field, ic (1.5)
 
 static constexpr uint32_t kAccJavaFlagsMask = 0xffff;  // bits set from Java sources (low 16)
 
-// The following flags are used to insert hidden API access flags into boot
-// class path dex files. They are decoded by DexFile::ClassDataItemIterator and
-// removed from the access flags before used by the runtime.
-static constexpr uint32_t kAccDexHiddenBit =          0x00000020;  // field, method (not native)
-static constexpr uint32_t kAccDexHiddenBitNative =    0x00000200;  // method (native)
-
 static constexpr uint32_t kAccConstructor =           0x00010000;  // method (dex only) <(cl)init>
 static constexpr uint32_t kAccDeclaredSynchronized =  0x00020000;  // method (dex only)
 static constexpr uint32_t kAccClassIsProxy =          0x00040000;  // class  (dex only)
@@ -92,9 +86,9 @@ static constexpr uint32_t kAccSingleImplementation =  0x08000000;  // method (ru
 
 static constexpr uint32_t kAccHiddenApiBits =         0x30000000;  // field, method
 
-// Not currently used, except for intrinsic methods where these bits
-// are part of the intrinsic ordinal.
-static constexpr uint32_t kAccMayBeUnusedBits =       0x40000000;
+// Non-intrinsics: Caches whether we can use fast-path in the interpreter invokes.
+// Intrinsics: These bits are part of the intrinsic ordinal.
+static constexpr uint32_t kAccFastInterpreterToInterpreterInvoke = 0x40000000;  // method.
 
 // Set by the compiler driver when compiling boot classes with instrinsic methods.
 static constexpr uint32_t kAccIntrinsic  =            0x80000000;  // method (runtime)
@@ -109,9 +103,9 @@ static constexpr uint32_t kAccClassIsFinalizable        = 0x80000000;
 
 // Continuous sequence of bits used to hold the ordinal of an intrinsic method. Flags
 // which overlap are not valid when kAccIntrinsic is set.
-static constexpr uint32_t kAccIntrinsicBits = kAccMayBeUnusedBits | kAccHiddenApiBits |
+static constexpr uint32_t kAccIntrinsicBits = kAccHiddenApiBits |
     kAccSingleImplementation | kAccMustCountLocks | kAccCompileDontBother | kAccDefaultConflict |
-    kAccPreviouslyWarm;
+    kAccPreviouslyWarm | kAccFastInterpreterToInterpreterInvoke;
 
 // Valid (meaningful) bits for a field.
 static constexpr uint32_t kAccValidFieldFlags = kAccPublic | kAccPrivate | kAccProtected |

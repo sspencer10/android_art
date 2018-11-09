@@ -1344,13 +1344,14 @@ static JdwpError ER_Set(JdwpState* state, Request* request, ExpandBuf* pReply)
   VLOG(jdwp) << StringPrintf("    --> event requestId=%#x", requestId);
 
   /* add it to the list */
+  // TODO: RegisterEvent() should take std::unique_ptr<>.
   JdwpError err = state->RegisterEvent(pEvent.get());
   if (err != ERR_NONE) {
     /* registration failed, probably because event is bogus */
     LOG(WARNING) << "WARNING: event request rejected";
     return err;
   }
-  pEvent.release();
+  pEvent.release();  // NOLINT b/117926937
   return ERR_NONE;
 }
 
@@ -1432,7 +1433,7 @@ static JdwpError DDM_Chunk(JdwpState* state, Request* request, ExpandBuf* pReply
 /*
  * Handler map decl.
  */
-typedef JdwpError (*JdwpRequestHandler)(JdwpState* state, Request* request, ExpandBuf* reply);
+using JdwpRequestHandler = JdwpError(*)(JdwpState* state, Request* request, ExpandBuf* reply);
 
 struct JdwpHandlerMap {
   uint8_t cmdSet;
@@ -1625,7 +1626,7 @@ size_t JdwpState::ProcessRequest(Request* request, ExpandBuf* pReply, bool* skip
      * so waitForDebugger() doesn't return if we stall for a bit here.
      */
     Dbg::GoActive();
-    last_activity_time_ms_.StoreSequentiallyConsistent(0);
+    last_activity_time_ms_.store(0, std::memory_order_seq_cst);
   }
 
   /*
@@ -1703,7 +1704,7 @@ size_t JdwpState::ProcessRequest(Request* request, ExpandBuf* pReply, bool* skip
    * the initial setup.  Only update if this is a non-DDMS packet.
    */
   if (request->GetCommandSet() != kJDWPDdmCmdSet) {
-    last_activity_time_ms_.StoreSequentiallyConsistent(MilliTime());
+    last_activity_time_ms_.store(MilliTime(), std::memory_order_seq_cst);
   }
 
   return replyLength;

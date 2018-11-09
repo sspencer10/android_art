@@ -24,18 +24,25 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <fstream>
 #include <memory>
 
 #include "android-base/file.h"
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
 
-#include "base/os.h"
+#include "os.h"
 
 #if defined(__APPLE__)
 #include <crt_externs.h>
 #include <sys/syscall.h>
 #include "AvailabilityMacros.h"  // For MAC_OS_X_VERSION_MAX_ALLOWED
+#endif
+
+#if defined(__BIONIC__)
+// membarrier(2) is only supported for target builds (b/111199492).
+#include <linux/membarrier.h>
+#include <sys/syscall.h>
 #endif
 
 #if defined(__linux__)
@@ -45,7 +52,6 @@
 namespace art {
 
 using android::base::ReadFileToString;
-using android::base::StringAppendF;
 using android::base::StringPrintf;
 
 pid_t GetTid() {
@@ -206,6 +212,27 @@ void SleepForever() {
   while (true) {
     usleep(1000000);
   }
+}
+
+std::string GetProcessStatus(const char* key) {
+  // Build search pattern of key and separator.
+  std::string pattern(key);
+  pattern.push_back(':');
+
+  // Search for status lines starting with pattern.
+  std::ifstream fs("/proc/self/status");
+  std::string line;
+  while (std::getline(fs, line)) {
+    if (strncmp(pattern.c_str(), line.c_str(), pattern.size()) == 0) {
+      // Skip whitespace in matching line (if any).
+      size_t pos = line.find_first_not_of(" \t", pattern.size());
+      if (UNLIKELY(pos == std::string::npos)) {
+        break;
+      }
+      return std::string(line, pos);
+    }
+  }
+  return "<unknown>";
 }
 
 }  // namespace art

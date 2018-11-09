@@ -27,7 +27,6 @@
 #include "android-base/stringprintf.h"
 
 #include "base/logging.h"  // For InitLogging.
-#include "base/mutex.h"
 #include "base/stringpiece.h"
 
 #include "dexlayout.h"
@@ -37,7 +36,6 @@
 #ifdef ART_TARGET_ANDROID
 #include "pagemap/pagemap.h"
 #endif
-#include "runtime.h"
 #include "vdex_file.h"
 
 namespace art {
@@ -92,7 +90,9 @@ class PageCount {
     map_[type]++;
   }
   size_t Get(uint16_t type) const {
-    return map_.at(type);
+    auto it = map_.find(type);
+    DCHECK(it != map_.end());
+    return it->second;
   }
  private:
   std::map<uint16_t, size_t> map_;
@@ -294,7 +294,7 @@ static void ProcessOneDexMapping(uint64_t* pagemap,
   {
     Options options;
     std::unique_ptr<dex_ir::Header> header(dex_ir::DexIrBuilder(*dex_file,
-                                                                /*eagerly_assign_offsets*/ true,
+                                                                /*eagerly_assign_offsets=*/ true,
                                                                 options));
     sections = dex_ir::GetSortedDexFileSections(header.get(),
                                                 dex_ir::SortDirection::kSortDescending);
@@ -321,9 +321,9 @@ static bool DisplayMappingIfFromVdexFile(pm_map_t* map, Printer* printer) {
   // Extract all the dex files from the vdex file.
   std::string error_msg;
   std::unique_ptr<VdexFile> vdex(VdexFile::Open(vdex_name,
-                                                false /*writeable*/,
-                                                false /*low_4gb*/,
-                                                false /*unquicken */,
+                                                /*writable=*/ false,
+                                                /*low_4gb=*/ false,
+                                                /*unquicken= */ false,
                                                 &error_msg /*out*/));
   if (vdex == nullptr) {
     std::cerr << "Could not open vdex file "
@@ -446,6 +446,11 @@ static void Usage(const char* cmd) {
   PrintLetterKey();
 }
 
+NO_RETURN static void Abort(const char* msg) {
+  std::cerr << msg;
+  exit(1);
+}
+
 static int DexDiagMain(int argc, char* argv[]) {
   if (argc < 2) {
     Usage(argv[0]);
@@ -471,8 +476,7 @@ static int DexDiagMain(int argc, char* argv[]) {
   }
 
   // Art specific set up.
-  Locks::Init();
-  InitLogging(argv, Runtime::Abort);
+  InitLogging(argv, Abort);
   MemMap::Init();
 
 #ifdef ART_TARGET_ANDROID

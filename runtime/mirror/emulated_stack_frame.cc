@@ -16,17 +16,19 @@
 
 #include "emulated_stack_frame.h"
 
-#include "class-inl.h"
-#include "gc_root-inl.h"
+#include "array-alloc-inl.h"
+#include "array-inl.h"
+#include "class-alloc-inl.h"
+#include "class_root.h"
 #include "jvalue-inl.h"
 #include "method_handles-inl.h"
 #include "method_handles.h"
+#include "object_array-alloc-inl.h"
+#include "object_array-inl.h"
 #include "reflection-inl.h"
 
 namespace art {
 namespace mirror {
-
-GcRoot<mirror::Class> EmulatedStackFrame::static_class_;
 
 // Calculates the size of a stack frame based on the size of its argument
 // types and return types.
@@ -166,8 +168,7 @@ mirror::EmulatedStackFrame* EmulatedStackFrame::CreateFromShadowFrameAndArgs(
   CalculateFrameAndReferencesSize(to_types.Get(), r_type.Get(), &frame_size, &refs_size);
 
   // Step 3 : Allocate the arrays.
-  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  ObjPtr<mirror::Class> array_class(class_linker->GetClassRoot(ClassLinker::kObjectArrayClass));
+  ObjPtr<mirror::Class> array_class(GetClassRoot<mirror::ObjectArray<mirror::Object>>());
 
   Handle<mirror::ObjectArray<mirror::Object>> references(hs.NewHandle(
       mirror::ObjectArray<mirror::Object>::Alloc(self, array_class, refs_size)));
@@ -192,7 +193,7 @@ mirror::EmulatedStackFrame* EmulatedStackFrame::CreateFromShadowFrameAndArgs(
 
   // Step 5: Construct the EmulatedStackFrame object.
   Handle<EmulatedStackFrame> sf(hs.NewHandle(
-      ObjPtr<EmulatedStackFrame>::DownCast(StaticClass()->AllocObject(self))));
+      ObjPtr<EmulatedStackFrame>::DownCast(GetClassRoot<EmulatedStackFrame>()->AllocObject(self))));
   sf->SetFieldObject<false>(CallsiteTypeOffset(), caller_type.Get());
   sf->SetFieldObject<false>(TypeOffset(), callee_type.Get());
   sf->SetFieldObject<false>(ReferencesOffset(), references.Get());
@@ -270,21 +271,6 @@ void EmulatedStackFrame::SetReturnValue(Thread* self, const JValue& value) {
       memcpy(array + length - sizeof(uint32_t), &primitive, sizeof(uint32_t));
     }
   }
-}
-
-void EmulatedStackFrame::SetClass(Class* klass) {
-  CHECK(static_class_.IsNull()) << static_class_.Read() << " " << klass;
-  CHECK(klass != nullptr);
-  static_class_ = GcRoot<Class>(klass);
-}
-
-void EmulatedStackFrame::ResetClass() {
-  CHECK(!static_class_.IsNull());
-  static_class_ = GcRoot<Class>(nullptr);
-}
-
-void EmulatedStackFrame::VisitRoots(RootVisitor* visitor) {
-  static_class_.VisitRootIfNonNull(visitor, RootInfo(kRootStickyClass));
 }
 
 }  // namespace mirror

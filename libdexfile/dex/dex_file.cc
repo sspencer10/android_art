@@ -31,6 +31,7 @@
 #include "base/enums.h"
 #include "base/leb128.h"
 #include "base/stl_util.h"
+#include "class_accessor-inl.h"
 #include "descriptors_names.h"
 #include "dex_file-inl.h"
 #include "standard_dex_file.h"
@@ -44,21 +45,6 @@ static_assert(sizeof(dex::StringIndex) == sizeof(uint32_t), "StringIndex size is
 static_assert(std::is_trivially_copyable<dex::StringIndex>::value, "StringIndex not trivial");
 static_assert(sizeof(dex::TypeIndex) == sizeof(uint16_t), "TypeIndex size is wrong");
 static_assert(std::is_trivially_copyable<dex::TypeIndex>::value, "TypeIndex not trivial");
-
-void DexFile::UnHideAccessFlags(ClassDataItemIterator& class_it) {
-  uint8_t* data = const_cast<uint8_t*>(class_it.DataPointer());
-  uint32_t new_flag = class_it.GetMemberAccessFlags();
-  bool is_method = class_it.IsAtMethod();
-  // Go back 1 uleb to start.
-  data = ReverseSearchUnsignedLeb128(data);
-  if (is_method) {
-    // Methods have another uleb field before the access flags
-    data = ReverseSearchUnsignedLeb128(data);
-  }
-  DCHECK_EQ(HiddenApiAccessFlags::RemoveFromDex(DecodeUnsignedLeb128WithoutMovingCursor(data)),
-            new_flag);
-  UpdateUnsignedLeb128(data, new_flag);
-}
 
 uint32_t DexFile::CalculateChecksum() const {
   return CalculateChecksum(Begin(), Size());
@@ -119,6 +105,7 @@ DexFile::DexFile(const uint8_t* base,
       num_method_handles_(0),
       call_site_ids_(nullptr),
       num_call_site_ids_(0),
+      hiddenapi_class_data_(nullptr),
       oat_dex_file_(oat_dex_file),
       container_(std::move(container)),
       is_compact_dex_(is_compact_dex),
@@ -194,6 +181,11 @@ void DexFile::InitializeSectionsFromMapList() {
     } else if (map_item.type_ == kDexTypeCallSiteIdItem) {
       call_site_ids_ = reinterpret_cast<const CallSiteIdItem*>(Begin() + map_item.offset_);
       num_call_site_ids_ = map_item.size_;
+    } else if (map_item.type_ == kDexTypeHiddenapiClassData) {
+      hiddenapi_class_data_ = GetHiddenapiClassDataAtOffset(map_item.offset_);
+    } else {
+      // Pointers to other sections are not necessary to retain in the DexFile struct.
+      // Other items have pointers directly into their data.
     }
   }
 }
@@ -220,21 +212,12 @@ const DexFile::ClassDef* DexFile::FindClassDef(dex::TypeIndex type_idx) const {
 
 uint32_t DexFile::FindCodeItemOffset(const DexFile::ClassDef& class_def,
                                      uint32_t method_idx) const {
-  const uint8_t* class_data = GetClassData(class_def);
-  CHECK(class_data != nullptr);
-  ClassDataItemIterator it(*this, class_data);
-  it.SkipAllFields();
-  while (it.HasNextDirectMethod()) {
-    if (it.GetMemberIndex() == method_idx) {
-      return it.GetMethodCodeItemOffset();
+  ClassAccessor accessor(*this, class_def);
+  CHECK(accessor.HasClassData());
+  for (const ClassAccessor::Method& method : accessor.GetMethods()) {
+    if (method.GetIndex() == method_idx) {
+      return method.GetCodeItemOffset();
     }
-    it.Next();
-  }
-  while (it.HasNextVirtualMethod()) {
-    if (it.GetMemberIndex() == method_idx) {
-      return it.GetMethodCodeItemOffset();
-    }
-    it.Next();
   }
   LOG(FATAL) << "Unable to find method " << method_idx;
   UNREACHABLE();
@@ -281,7 +264,7 @@ const DexFile::MethodId* DexFile::FindMethodId(const DexFile::TypeId& declaring_
   // Binary search MethodIds knowing that they are sorted by class_idx, name_idx then proto_idx
   const dex::TypeIndex class_idx = GetIndexForTypeId(declaring_klass);
   const dex::StringIndex name_idx = GetIndexForStringId(name);
-  const uint16_t proto_idx = GetIndexForProtoId(signature);
+  const dex::ProtoIndex proto_idx = GetIndexForProtoId(signature);
   int32_t lo = 0;
   int32_t hi = NumMethodIds() - 1;
   while (hi >= lo) {
@@ -349,25 +332,6 @@ const DexFile::TypeId* DexFile::FindTypeId(const char* string) const {
   return nullptr;
 }
 
-const DexFile::StringId* DexFile::FindStringId(const uint16_t* string, size_t length) const {
-  int32_t lo = 0;
-  int32_t hi = NumStringIds() - 1;
-  while (hi >= lo) {
-    int32_t mid = (hi + lo) / 2;
-    const DexFile::StringId& str_id = GetStringId(dex::StringIndex(mid));
-    const char* str = GetStringData(str_id);
-    int compare = CompareModifiedUtf8ToUtf16AsCodePointValues(str, string, length);
-    if (compare > 0) {
-      lo = mid + 1;
-    } else if (compare < 0) {
-      hi = mid - 1;
-    } else {
-      return &str_id;
-    }
-  }
-  return nullptr;
-}
-
 const DexFile::TypeId* DexFile::FindTypeId(dex::StringIndex string_idx) const {
   int32_t lo = 0;
   int32_t hi = NumTypeIds() - 1;
@@ -392,7 +356,8 @@ const DexFile::ProtoId* DexFile::FindProtoId(dex::TypeIndex return_type_idx,
   int32_t hi = NumProtoIds() - 1;
   while (hi >= lo) {
     int32_t mid = (hi + lo) / 2;
-    const DexFile::ProtoId& proto = GetProtoId(mid);
+    const dex::ProtoIndex proto_idx = static_cast<dex::ProtoIndex>(mid);
+    const DexFile::ProtoId& proto = GetProtoId(proto_idx);
     int compare = return_type_idx.index_ - proto.return_type_idx_.index_;
     if (compare == 0) {
       DexFileParameterIterator it(*this, proto);
@@ -508,22 +473,6 @@ int32_t DexFile::FindTryItem(const TryItem* try_items, uint32_t tries_size, uint
   return -1;
 }
 
-bool DexFile::LineNumForPcCb(void* raw_context, const PositionInfo& entry) {
-  LineNumFromPcContext* context = reinterpret_cast<LineNumFromPcContext*>(raw_context);
-
-  // We know that this callback will be called in
-  // ascending address order, so keep going until we find
-  // a match or we've just gone past it.
-  if (entry.address_ > context->address_) {
-    // The line number from the previous positions callback
-    // wil be the final result.
-    return true;
-  } else {
-    context->line_num_ = entry.line_;
-    return entry.address_ == context->address_;
-  }
-}
-
 // Read a signed integer.  "zwidth" is the zero-based byte count.
 int32_t DexFile::ReadSignedInt(const uint8_t* ptr, int zwidth) {
   int32_t val = 0;
@@ -624,6 +573,15 @@ std::string DexFile::PrettyType(dex::TypeIndex type_idx) const {
   return PrettyDescriptor(GetTypeDescriptor(type_id));
 }
 
+dex::ProtoIndex DexFile::GetProtoIndexForCallSite(uint32_t call_site_idx) const {
+  const DexFile::CallSiteIdItem& csi = GetCallSiteId(call_site_idx);
+  CallSiteArrayValueIterator it(*this, csi);
+  it.Next();
+  it.Next();
+  DCHECK_EQ(EncodedArrayValueIterator::ValueType::kMethodType, it.GetValueType());
+  return dex::ProtoIndex(it.GetJavaValue().i);
+}
+
 // Checks that visibility is as expected. Includes special behavior for M and
 // before to allow runtime and build visibility when expecting runtime.
 std::ostream& operator<<(std::ostream& os, const DexFile& dex_file) {
@@ -692,31 +650,6 @@ bool Signature::operator==(const StringPiece& rhs) const {
 
 std::ostream& operator<<(std::ostream& os, const Signature& sig) {
   return os << sig.ToString();
-}
-
-// Decodes the header section from the class data bytes.
-void ClassDataItemIterator::ReadClassDataHeader() {
-  CHECK(ptr_pos_ != nullptr);
-  header_.static_fields_size_ = DecodeUnsignedLeb128(&ptr_pos_);
-  header_.instance_fields_size_ = DecodeUnsignedLeb128(&ptr_pos_);
-  header_.direct_methods_size_ = DecodeUnsignedLeb128(&ptr_pos_);
-  header_.virtual_methods_size_ = DecodeUnsignedLeb128(&ptr_pos_);
-}
-
-void ClassDataItemIterator::ReadClassDataField() {
-  field_.field_idx_delta_ = DecodeUnsignedLeb128(&ptr_pos_);
-  field_.access_flags_ = DecodeUnsignedLeb128(&ptr_pos_);
-  // The user of the iterator is responsible for checking if there
-  // are unordered or duplicate indexes.
-}
-
-void ClassDataItemIterator::ReadClassDataMethod() {
-  method_.method_idx_delta_ = DecodeUnsignedLeb128(&ptr_pos_);
-  method_.access_flags_ = DecodeUnsignedLeb128(&ptr_pos_);
-  method_.code_off_ = DecodeUnsignedLeb128(&ptr_pos_);
-  if (last_idx_ != 0 && method_.method_idx_delta_ == 0) {
-    LOG(WARNING) << "Duplicate method in " << dex_file_.GetLocation();
-  }
 }
 
 EncodedArrayValueIterator::EncodedArrayValueIterator(const DexFile& dex_file,
@@ -795,6 +728,11 @@ void EncodedArrayValueIterator::Next() {
 }
 
 namespace dex {
+
+std::ostream& operator<<(std::ostream& os, const ProtoIndex& index) {
+  os << "ProtoIndex[" << index.index_ << "]";
+  return os;
+}
 
 std::ostream& operator<<(std::ostream& os, const StringIndex& index) {
   os << "StringIndex[" << index.index_ << "]";

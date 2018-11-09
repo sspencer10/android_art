@@ -31,8 +31,9 @@
 #include "imt_conflict_table.h"
 #include "imtable-inl.h"
 #include "indirect_reference_table.h"
-#include "jni_internal.h"
-#include "mirror/array.h"
+#include "jni/jni_internal.h"
+#include "mirror/array-alloc-inl.h"
+#include "mirror/class-alloc-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/throwable.h"
@@ -45,10 +46,8 @@
 namespace art {
 
 inline ArtMethod* GetResolvedMethod(ArtMethod* outer_method,
-                                    const MethodInfo& method_info,
-                                    const InlineInfo& inline_info,
-                                    const InlineInfoEncoding& encoding,
-                                    uint8_t inlining_depth)
+                                    const CodeInfo& code_info,
+                                    const BitTableRange<InlineInfo>& inline_infos)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   DCHECK(!outer_method->IsObsolete());
 
@@ -57,25 +56,29 @@ inline ArtMethod* GetResolvedMethod(ArtMethod* outer_method,
   // suspended while executing it.
   ScopedAssertNoThreadSuspension sants(__FUNCTION__);
 
-  if (inline_info.EncodesArtMethodAtDepth(encoding, inlining_depth)) {
-    return inline_info.GetArtMethodAtDepth(encoding, inlining_depth);
-  }
+  {
+    InlineInfo inline_info = inline_infos.back();
 
-  uint32_t method_index = inline_info.GetMethodIndexAtDepth(encoding, method_info, inlining_depth);
-  if (inline_info.GetDexPcAtDepth(encoding, inlining_depth) == static_cast<uint32_t>(-1)) {
-    // "charAt" special case. It is the only non-leaf method we inline across dex files.
-    ArtMethod* inlined_method = jni::DecodeArtMethod(WellKnownClasses::java_lang_String_charAt);
-    DCHECK_EQ(inlined_method->GetDexMethodIndex(), method_index);
-    return inlined_method;
+    if (inline_info.EncodesArtMethod()) {
+      return inline_info.GetArtMethod();
+    }
+
+    uint32_t method_index = code_info.GetMethodIndexOf(inline_info);
+    if (inline_info.GetDexPc() == static_cast<uint32_t>(-1)) {
+      // "charAt" special case. It is the only non-leaf method we inline across dex files.
+      ArtMethod* inlined_method = jni::DecodeArtMethod(WellKnownClasses::java_lang_String_charAt);
+      DCHECK_EQ(inlined_method->GetDexMethodIndex(), method_index);
+      return inlined_method;
+    }
   }
 
   // Find which method did the call in the inlining hierarchy.
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   ArtMethod* method = outer_method;
-  for (uint32_t depth = 0, end = inlining_depth + 1u; depth != end; ++depth) {
-    DCHECK(!inline_info.EncodesArtMethodAtDepth(encoding, depth));
-    DCHECK_NE(inline_info.GetDexPcAtDepth(encoding, depth), static_cast<uint32_t>(-1));
-    method_index = inline_info.GetMethodIndexAtDepth(encoding, method_info, depth);
+  for (InlineInfo inline_info : inline_infos) {
+    DCHECK(!inline_info.EncodesArtMethod());
+    DCHECK_NE(inline_info.GetDexPc(), static_cast<uint32_t>(-1));
+    uint32_t method_index = code_info.GetMethodIndexOf(inline_info);
     ArtMethod* inlined_method = class_linker->LookupResolvedMethod(method_index,
                                                                    method->GetDexCache(),
                                                                    method->GetClassLoader());
@@ -91,15 +94,17 @@ inline ArtMethod* GetResolvedMethod(ArtMethod* outer_method,
       // even going back from boot image methods to the same oat file. However, this is
       // not currently implemented in the compiler. Therefore crossing dex file boundary
       // indicates that the inlined definition is not the same as the one used at runtime.
-      LOG(FATAL) << "Inlined method resolution crossed dex file boundary: from "
-                 << method->PrettyMethod()
-                 << " in " << method->GetDexFile()->GetLocation() << "/"
-                 << static_cast<const void*>(method->GetDexFile())
-                 << " to " << inlined_method->PrettyMethod()
-                 << " in " << inlined_method->GetDexFile()->GetLocation() << "/"
-                 << static_cast<const void*>(inlined_method->GetDexFile()) << ". "
-                 << "This must be due to duplicate classes or playing wrongly with class loaders";
-      UNREACHABLE();
+      bool target_sdk_pre_p = Runtime::Current()->GetTargetSdkVersion() < 28;
+      LOG(target_sdk_pre_p ? WARNING : FATAL)
+          << "Inlined method resolution crossed dex file boundary: from "
+          << method->PrettyMethod()
+          << " in " << method->GetDexFile()->GetLocation() << "/"
+          << static_cast<const void*>(method->GetDexFile())
+          << " to " << inlined_method->PrettyMethod()
+          << " in " << inlined_method->GetDexFile()->GetLocation() << "/"
+          << static_cast<const void*>(inlined_method->GetDexFile()) << ". "
+          << "This must be due to duplicate classes or playing wrongly with class loaders. "
+          << "The runtime is in an unsafe state.";
     }
     method = inlined_method;
   }
@@ -187,7 +192,7 @@ inline mirror::Object* AllocObjectFromCode(mirror::Class* klass,
       return nullptr;
     }
     // CheckObjectAlloc can cause thread suspension which means we may now be instrumented.
-    return klass->Alloc</*kInstrumented*/true>(
+    return klass->Alloc</*kInstrumented=*/true>(
         self,
         Runtime::Current()->GetHeap()->GetCurrentAllocator()).Ptr();
   }
@@ -212,7 +217,7 @@ inline mirror::Object* AllocObjectFromCodeResolved(mirror::Class* klass,
     // Pass in false since the object cannot be finalizable.
     // CheckClassInitializedForObjectAlloc can cause thread suspension which means we may now be
     // instrumented.
-    return klass->Alloc</*kInstrumented*/true, false>(self, heap->GetCurrentAllocator()).Ptr();
+    return klass->Alloc</*kInstrumented=*/true, false>(self, heap->GetCurrentAllocator()).Ptr();
   }
   // Pass in false since the object cannot be finalizable.
   return klass->Alloc<kInstrumented, false>(self, allocator_type).Ptr();
@@ -253,7 +258,7 @@ inline mirror::Class* CheckArrayAlloc(dex::TypeIndex type_idx,
     CHECK(klass->IsArrayClass()) << klass->PrettyClass();
   }
   if (kAccessCheck) {
-    mirror::Class* referrer = method->GetDeclaringClass();
+    ObjPtr<mirror::Class> referrer = method->GetDeclaringClass();
     if (UNLIKELY(!referrer->CanAccess(klass))) {
       ThrowIllegalAccessErrorClass(referrer, klass);
       *slow_path = true;
@@ -269,25 +274,25 @@ inline mirror::Class* CheckArrayAlloc(dex::TypeIndex type_idx,
 // check.
 template <bool kAccessCheck, bool kInstrumented>
 ALWAYS_INLINE
-inline mirror::Array* AllocArrayFromCode(dex::TypeIndex type_idx,
-                                         int32_t component_count,
-                                         ArtMethod* method,
-                                         Thread* self,
-                                         gc::AllocatorType allocator_type) {
+inline ObjPtr<mirror::Array> AllocArrayFromCode(dex::TypeIndex type_idx,
+                                                int32_t component_count,
+                                                ArtMethod* method,
+                                                Thread* self,
+                                                gc::AllocatorType allocator_type) {
   bool slow_path = false;
-  mirror::Class* klass = CheckArrayAlloc<kAccessCheck>(type_idx, component_count, method,
-                                                       &slow_path);
+  ObjPtr<mirror::Class> klass =
+      CheckArrayAlloc<kAccessCheck>(type_idx, component_count, method, &slow_path);
   if (UNLIKELY(slow_path)) {
     if (klass == nullptr) {
       return nullptr;
     }
     gc::Heap* heap = Runtime::Current()->GetHeap();
     // CheckArrayAlloc can cause thread suspension which means we may now be instrumented.
-    return mirror::Array::Alloc</*kInstrumented*/true>(self,
-                                                       klass,
-                                                       component_count,
-                                                       klass->GetComponentSizeShift(),
-                                                       heap->GetCurrentAllocator());
+    return mirror::Array::Alloc</*kInstrumented=*/true>(self,
+                                                        klass,
+                                                        component_count,
+                                                        klass->GetComponentSizeShift(),
+                                                        heap->GetCurrentAllocator());
   }
   return mirror::Array::Alloc<kInstrumented>(self, klass, component_count,
                                              klass->GetComponentSizeShift(), allocator_type);
@@ -307,7 +312,7 @@ inline mirror::Array* AllocArrayFromCodeResolved(mirror::Class* klass,
   // No need to retry a slow-path allocation as the above code won't cause a GC or thread
   // suspension.
   return mirror::Array::Alloc<kInstrumented>(self, klass, component_count,
-                                             klass->GetComponentSizeShift(), allocator_type);
+                                             klass->GetComponentSizeShift(), allocator_type).Ptr();
 }
 
 template<FindFieldType type, bool access_check>
@@ -315,20 +320,9 @@ inline ArtField* FindFieldFromCode(uint32_t field_idx,
                                    ArtMethod* referrer,
                                    Thread* self,
                                    size_t expected_size) {
-  bool is_primitive;
-  bool is_set;
-  bool is_static;
-  switch (type) {
-    case InstanceObjectRead:     is_primitive = false; is_set = false; is_static = false; break;
-    case InstanceObjectWrite:    is_primitive = false; is_set = true;  is_static = false; break;
-    case InstancePrimitiveRead:  is_primitive = true;  is_set = false; is_static = false; break;
-    case InstancePrimitiveWrite: is_primitive = true;  is_set = true;  is_static = false; break;
-    case StaticObjectRead:       is_primitive = false; is_set = false; is_static = true;  break;
-    case StaticObjectWrite:      is_primitive = false; is_set = true;  is_static = true;  break;
-    case StaticPrimitiveRead:    is_primitive = true;  is_set = false; is_static = true;  break;
-    case StaticPrimitiveWrite:   // Keep GCC happy by having a default handler, fall-through.
-    default:                     is_primitive = true;  is_set = true;  is_static = true;  break;
-  }
+  constexpr bool is_primitive = (type & FindFieldFlags::PrimitiveBit) != 0;
+  constexpr bool is_set = (type & FindFieldFlags::WriteBit) != 0;
+  constexpr bool is_static = (type & FindFieldFlags::StaticBit) != 0;
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
 
   ArtField* resolved_field;
@@ -364,7 +358,7 @@ inline ArtField* FindFieldFromCode(uint32_t field_idx,
       ThrowIncompatibleClassChangeErrorField(resolved_field, is_static, referrer);
       return nullptr;
     }
-    mirror::Class* referring_class = referrer->GetDeclaringClass();
+    ObjPtr<mirror::Class> referring_class = referrer->GetDeclaringClass();
     if (UNLIKELY(!referring_class->CheckResolvedFieldAccess(fields_class,
                                                             resolved_field,
                                                             referrer->GetDexCache(),
@@ -429,28 +423,17 @@ EXPLICIT_FIND_FIELD_FROM_CODE_TYPED_TEMPLATE_DECL(StaticPrimitiveWrite);
 #undef EXPLICIT_FIND_FIELD_FROM_CODE_TYPED_TEMPLATE_DECL
 #undef EXPLICIT_FIND_FIELD_FROM_CODE_TEMPLATE_DECL
 
+// Follow virtual/interface indirections if applicable.
+// Will throw null-pointer exception the if the object is null.
 template<InvokeType type, bool access_check>
-inline ArtMethod* FindMethodFromCode(uint32_t method_idx,
-                                     ObjPtr<mirror::Object>* this_object,
-                                     ArtMethod* referrer,
-                                     Thread* self) {
+ALWAYS_INLINE ArtMethod* FindMethodToCall(uint32_t method_idx,
+                                          ArtMethod* resolved_method,
+                                          ObjPtr<mirror::Object>* this_object,
+                                          ArtMethod* referrer,
+                                          Thread* self)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   ClassLinker* const class_linker = Runtime::Current()->GetClassLinker();
-  constexpr ClassLinker::ResolveMode resolve_mode =
-      access_check ? ClassLinker::ResolveMode::kCheckICCEAndIAE
-                   : ClassLinker::ResolveMode::kNoChecks;
-  ArtMethod* resolved_method;
-  if (type == kStatic) {
-    resolved_method = class_linker->ResolveMethod<resolve_mode>(self, method_idx, referrer, type);
-  } else {
-    StackHandleScope<1> hs(self);
-    HandleWrapperObjPtr<mirror::Object> h_this(hs.NewHandleWrapper(this_object));
-    resolved_method = class_linker->ResolveMethod<resolve_mode>(self, method_idx, referrer, type);
-  }
-  if (UNLIKELY(resolved_method == nullptr)) {
-    DCHECK(self->IsExceptionPending());  // Throw exception and unwind.
-    return nullptr;  // Failure.
-  }
-  // Next, null pointer check.
+  // Null pointer check.
   if (UNLIKELY(*this_object == nullptr && type != kStatic)) {
     if (UNLIKELY(resolved_method->GetDeclaringClass()->IsStringClass() &&
                  resolved_method->IsConstructor())) {
@@ -548,7 +531,13 @@ inline ArtMethod* FindMethodFromCode(uint32_t method_idx,
       UNREACHABLE();
     }
     case kInterface: {
-      uint32_t imt_index = ImTable::GetImtIndex(resolved_method);
+      size_t imt_index;
+      InterpreterCache* tls_cache = self->GetInterpreterCache();
+      if (UNLIKELY(!tls_cache->Get(resolved_method, &imt_index))) {
+        imt_index = ImTable::GetImtIndex(resolved_method);
+        tls_cache->Set(resolved_method, imt_index);
+      }
+      DCHECK_EQ(imt_index, ImTable::GetImtIndex(resolved_method));
       PointerSize pointer_size = class_linker->GetImagePointerSize();
       ObjPtr<mirror::Class> klass = (*this_object)->GetClass();
       ArtMethod* imt_method = klass->GetImt(pointer_size)->Get(imt_index, pointer_size);
@@ -577,6 +566,31 @@ inline ArtMethod* FindMethodFromCode(uint32_t method_idx,
       LOG(FATAL) << "Unknown invoke type " << type;
       return nullptr;  // Failure.
   }
+}
+
+template<InvokeType type, bool access_check>
+inline ArtMethod* FindMethodFromCode(uint32_t method_idx,
+                                     ObjPtr<mirror::Object>* this_object,
+                                     ArtMethod* referrer,
+                                     Thread* self) {
+  ClassLinker* const class_linker = Runtime::Current()->GetClassLinker();
+  constexpr ClassLinker::ResolveMode resolve_mode =
+      access_check ? ClassLinker::ResolveMode::kCheckICCEAndIAE
+                   : ClassLinker::ResolveMode::kNoChecks;
+  ArtMethod* resolved_method;
+  if (type == kStatic) {
+    resolved_method = class_linker->ResolveMethod<resolve_mode>(self, method_idx, referrer, type);
+  } else {
+    StackHandleScope<1> hs(self);
+    HandleWrapperObjPtr<mirror::Object> h_this(hs.NewHandleWrapper(this_object));
+    resolved_method = class_linker->ResolveMethod<resolve_mode>(self, method_idx, referrer, type);
+  }
+  if (UNLIKELY(resolved_method == nullptr)) {
+    DCHECK(self->IsExceptionPending());  // Throw exception and unwind.
+    return nullptr;  // Failure.
+  }
+  return FindMethodToCall<type, access_check>(
+      method_idx, resolved_method, this_object, referrer, self);
 }
 
 // Explicit template declarations of FindMethodFromCode for all invoke types.
@@ -609,22 +623,9 @@ inline ArtField* FindFieldFast(uint32_t field_idx, ArtMethod* referrer, FindFiel
     return nullptr;
   }
   // Check for incompatible class change.
-  bool is_primitive;
-  bool is_set;
-  bool is_static;
-  switch (type) {
-    case InstanceObjectRead:     is_primitive = false; is_set = false; is_static = false; break;
-    case InstanceObjectWrite:    is_primitive = false; is_set = true;  is_static = false; break;
-    case InstancePrimitiveRead:  is_primitive = true;  is_set = false; is_static = false; break;
-    case InstancePrimitiveWrite: is_primitive = true;  is_set = true;  is_static = false; break;
-    case StaticObjectRead:       is_primitive = false; is_set = false; is_static = true;  break;
-    case StaticObjectWrite:      is_primitive = false; is_set = true;  is_static = true;  break;
-    case StaticPrimitiveRead:    is_primitive = true;  is_set = false; is_static = true;  break;
-    case StaticPrimitiveWrite:   is_primitive = true;  is_set = true;  is_static = true;  break;
-    default:
-      LOG(FATAL) << "UNREACHABLE";
-      UNREACHABLE();
-  }
+  const bool is_primitive = (type & FindFieldFlags::PrimitiveBit) != 0;
+  const bool is_set = (type & FindFieldFlags::WriteBit) != 0;
+  const bool is_static = (type & FindFieldFlags::StaticBit) != 0;
   if (UNLIKELY(resolved_field->IsStatic() != is_static)) {
     // Incompatible class change.
     return nullptr;
@@ -719,7 +720,7 @@ inline ObjPtr<mirror::Class> ResolveVerifyAndClinit(dex::TypeIndex type_idx,
     return nullptr;  // Failure - Indicate to caller to deliver exception
   }
   // Perform access check if necessary.
-  mirror::Class* referring_class = referrer->GetDeclaringClass();
+  ObjPtr<mirror::Class> referring_class = referrer->GetDeclaringClass();
   if (verify_access && UNLIKELY(!referring_class->CanAccess(klass))) {
     ThrowIllegalAccessErrorClass(referring_class, klass);
     return nullptr;  // Failure - Indicate to caller to deliver exception
@@ -742,33 +743,6 @@ inline ObjPtr<mirror::Class> ResolveVerifyAndClinit(dex::TypeIndex type_idx,
     return nullptr;  // Failure - Indicate to caller to deliver exception
   }
   return h_class.Get();
-}
-
-static inline ObjPtr<mirror::String> ResolveString(ClassLinker* class_linker,
-                                                   dex::StringIndex string_idx,
-                                                   ArtMethod* referrer)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  Thread::PoisonObjectPointersIfDebug();
-  ObjPtr<mirror::String> string = referrer->GetDexCache()->GetResolvedString(string_idx);
-  if (UNLIKELY(string == nullptr)) {
-    StackHandleScope<1> hs(Thread::Current());
-    Handle<mirror::DexCache> dex_cache(hs.NewHandle(referrer->GetDexCache()));
-    string = class_linker->ResolveString(string_idx, dex_cache);
-  }
-  return string;
-}
-
-inline ObjPtr<mirror::String> ResolveStringFromCode(ArtMethod* referrer,
-                                                    dex::StringIndex string_idx) {
-  Thread::PoisonObjectPointersIfDebug();
-  ObjPtr<mirror::String> string = referrer->GetDexCache()->GetResolvedString(string_idx);
-  if (UNLIKELY(string == nullptr)) {
-    StackHandleScope<1> hs(Thread::Current());
-    Handle<mirror::DexCache> dex_cache(hs.NewHandle(referrer->GetDexCache()));
-    ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-    string = class_linker->ResolveString(string_idx, dex_cache);
-  }
-  return string;
 }
 
 inline void UnlockJniSynchronizedMethod(jobject locked, Thread* self) {

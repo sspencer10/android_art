@@ -17,11 +17,15 @@
 #ifndef ART_LIBDEXFILE_DEX_DEX_FILE_INL_H_
 #define ART_LIBDEXFILE_DEX_DEX_FILE_INL_H_
 
+#include "dex_file.h"
+
 #include "base/casts.h"
 #include "base/leb128.h"
 #include "base/stringpiece.h"
+#include "base/utils.h"
+#include "class_iterator.h"
 #include "compact_dex_file.h"
-#include "dex_file.h"
+#include "dex_instruction_iterator.h"
 #include "invoke_type.h"
 #include "standard_dex_file.h"
 
@@ -106,6 +110,14 @@ inline const char* DexFile::GetMethodName(const MethodId& method_id) const {
   return StringDataByIdx(method_id.name_idx_);
 }
 
+inline const char* DexFile::GetMethodName(const MethodId& method_id, uint32_t* utf_length) const {
+  return StringDataAndUtf16LengthByIdx(method_id.name_idx_, utf_length);
+}
+
+inline const char* DexFile::GetMethodName(uint32_t idx, uint32_t* utf_length) const {
+  return StringDataAndUtf16LengthByIdx(GetMethodId(idx).name_idx_, utf_length);
+}
+
 inline const char* DexFile::GetMethodShorty(uint32_t idx) const {
   return StringDataByIdx(GetProtoId(GetMethodId(idx).proto_idx_).shorty_idx_);
 }
@@ -127,7 +139,7 @@ inline const char* DexFile::GetReturnTypeDescriptor(const ProtoId& proto_id) con
   return StringByTypeIdx(proto_id.return_type_idx_);
 }
 
-inline const char* DexFile::GetShorty(uint32_t proto_idx) const {
+inline const char* DexFile::GetShorty(dex::ProtoIndex proto_idx) const {
   const ProtoId& proto_id = GetProtoId(proto_idx);
   return StringDataByIdx(proto_id.shorty_idx_);
 }
@@ -201,26 +213,6 @@ inline bool Signature::operator==(const Signature& rhs) const {
   return true;
 }
 
-inline
-InvokeType ClassDataItemIterator::GetMethodInvokeType(const DexFile::ClassDef& class_def) const {
-  if (HasNextDirectMethod()) {
-    if ((GetRawMemberAccessFlags() & kAccStatic) != 0) {
-      return kStatic;
-    } else {
-      return kDirect;
-    }
-  } else {
-    DCHECK_EQ(GetRawMemberAccessFlags() & kAccStatic, 0U);
-    if ((class_def.access_flags_ & kAccInterface) != 0) {
-      return kInterface;
-    } else if ((GetRawMemberAccessFlags() & kAccConstructor) != 0) {
-      return kSuper;
-    } else {
-      return kVirtual;
-    }
-  }
-}
-
 template<typename NewLocalCallback, typename IndexToStringData, typename TypeIndexToStringData>
 bool DexFile::DecodeDebugLocalInfo(const uint8_t* stream,
                                    const std::string& location,
@@ -231,10 +223,9 @@ bool DexFile::DecodeDebugLocalInfo(const uint8_t* stream,
                                    uint16_t registers_size,
                                    uint16_t ins_size,
                                    uint16_t insns_size_in_code_units,
-                                   IndexToStringData index_to_string_data,
-                                   TypeIndexToStringData type_index_to_string_data,
-                                   NewLocalCallback new_local_callback,
-                                   void* context) {
+                                   const IndexToStringData& index_to_string_data,
+                                   const TypeIndexToStringData& type_index_to_string_data,
+                                   const NewLocalCallback& new_local_callback) {
   if (stream == nullptr) {
     return false;
   }
@@ -294,7 +285,7 @@ bool DexFile::DecodeDebugLocalInfo(const uint8_t* stream,
         for (uint16_t reg = 0; reg < registers_size; reg++) {
           if (local_in_reg[reg].is_live_) {
             local_in_reg[reg].end_address_ = insns_size_in_code_units;
-            new_local_callback(context, local_in_reg[reg]);
+            new_local_callback(local_in_reg[reg]);
           }
         }
         return true;
@@ -323,7 +314,7 @@ bool DexFile::DecodeDebugLocalInfo(const uint8_t* stream,
         // Emit what was previously there, if anything
         if (local_in_reg[reg].is_live_) {
           local_in_reg[reg].end_address_ = address;
-          new_local_callback(context, local_in_reg[reg]);
+          new_local_callback(local_in_reg[reg]);
         }
 
         local_in_reg[reg].name_ = index_to_string_data(name_idx);
@@ -345,7 +336,7 @@ bool DexFile::DecodeDebugLocalInfo(const uint8_t* stream,
         // closed register is sloppy, but harmless if no further action is taken.
         if (local_in_reg[reg].is_live_) {
           local_in_reg[reg].end_address_ = address;
-          new_local_callback(context, local_in_reg[reg]);
+          new_local_callback(local_in_reg[reg]);
           local_in_reg[reg].is_live_ = false;
         }
         break;
@@ -385,8 +376,7 @@ bool DexFile::DecodeDebugLocalInfo(uint32_t registers_size,
                                    uint32_t debug_info_offset,
                                    bool is_static,
                                    uint32_t method_idx,
-                                   NewLocalCallback new_local_callback,
-                                   void* context) const {
+                                   const NewLocalCallback& new_local_callback) const {
   const uint8_t* const stream = GetDebugInfoStream(debug_info_offset);
   if (stream == nullptr) {
     return false;
@@ -412,25 +402,19 @@ bool DexFile::DecodeDebugLocalInfo(uint32_t registers_size,
                                 return StringByTypeIdx(dex::TypeIndex(
                                     dchecked_integral_cast<uint16_t>(idx)));
                               },
-                              new_local_callback,
-                              context);
+                              new_local_callback);
 }
 
 template<typename DexDebugNewPosition, typename IndexToStringData>
 bool DexFile::DecodeDebugPositionInfo(const uint8_t* stream,
-                                      IndexToStringData index_to_string_data,
-                                      DexDebugNewPosition position_functor,
-                                      void* context) {
+                                      const IndexToStringData& index_to_string_data,
+                                      const DexDebugNewPosition& position_functor) {
   if (stream == nullptr) {
     return false;
   }
 
-  PositionInfo entry = PositionInfo();
-  entry.line_ = DecodeUnsignedLeb128(&stream);
-  uint32_t parameters_size = DecodeUnsignedLeb128(&stream);
-  for (uint32_t i = 0; i < parameters_size; ++i) {
-    DecodeUnsignedLeb128P1(&stream);  // Parameter name.
-  }
+  PositionInfo entry;
+  entry.line_ = DecodeDebugInfoParameterNames(&stream, VoidFunctor());
 
   for (;;)  {
     uint8_t opcode = *stream++;
@@ -473,7 +457,7 @@ bool DexFile::DecodeDebugPositionInfo(const uint8_t* stream,
         int adjopcode = opcode - DBG_FIRST_SPECIAL;
         entry.address_ += adjopcode / DBG_LINE_RANGE;
         entry.line_ += DBG_LINE_BASE + (adjopcode % DBG_LINE_RANGE);
-        if (position_functor(context, entry)) {
+        if (position_functor(entry)) {
           return true;  // early exit.
         }
         entry.prologue_end_ = false;
@@ -482,18 +466,6 @@ bool DexFile::DecodeDebugPositionInfo(const uint8_t* stream,
       }
     }
   }
-}
-
-template<typename DexDebugNewPosition>
-bool DexFile::DecodeDebugPositionInfo(uint32_t debug_info_offset,
-                                      DexDebugNewPosition position_functor,
-                                      void* context) const {
-  return DecodeDebugPositionInfo(GetDebugInfoStream(debug_info_offset),
-                                 [this](uint32_t idx) {
-                                   return StringDataByIdx(dex::StringIndex(idx));
-                                 },
-                                 position_functor,
-                                 context);
 }
 
 inline const CompactDexFile* DexFile::AsCompactDexFile() const {
@@ -515,16 +487,20 @@ inline const uint8_t* DexFile::GetCatchHandlerData(const DexInstructionIterator&
   return handler_data + offset;
 }
 
+inline IterationRange<ClassIterator> DexFile::GetClasses() const {
+  return { ClassIterator(*this, 0u), ClassIterator(*this, NumClassDefs()) };
+}
+
+// Returns the line number
 template <typename Visitor>
-inline void DexFile::ClassDef::VisitMethods(const DexFile* dex_file, const Visitor& visitor) const {
-  const uint8_t* class_data = dex_file->GetClassData(*this);
-  if (class_data != nullptr) {
-    ClassDataItemIterator it(*dex_file, class_data);
-    it.SkipAllFields();
-    for (; it.HasNext(); it.Next()) {
-      visitor(it);
-    }
+inline uint32_t DexFile::DecodeDebugInfoParameterNames(const uint8_t** debug_info,
+                                                       const Visitor& visitor) {
+  uint32_t line = DecodeUnsignedLeb128(debug_info);
+  const uint32_t parameters_size = DecodeUnsignedLeb128(debug_info);
+  for (uint32_t i = 0; i < parameters_size; ++i) {
+    visitor(dex::StringIndex(DecodeUnsignedLeb128P1(debug_info)));
   }
+  return line;
 }
 
 }  // namespace art

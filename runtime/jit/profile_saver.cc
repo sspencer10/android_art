@@ -37,14 +37,19 @@
 #include "gc/collector_type.h"
 #include "gc/gc_cause.h"
 #include "gc/scoped_gc_critical_section.h"
-#include "jit/profile_compilation_info.h"
+#include "jit/profiling_info.h"
 #include "oat_file_manager.h"
+#include "profile/profile_compilation_info.h"
 #include "scoped_thread_state_change-inl.h"
 
 namespace art {
 
 ProfileSaver* ProfileSaver::instance_ = nullptr;
 pthread_t ProfileSaver::profiler_pthread_ = 0U;
+
+static_assert(ProfileCompilationInfo::kIndividualInlineCacheSize ==
+              InlineCache::kIndividualCacheSize,
+              "InlineCache and ProfileCompilationInfo do not agree on kIndividualCacheSize");
 
 // At what priority to schedule the saver threads. 9 is the lowest foreground priority on device.
 static constexpr int kProfileSaverPthreadPriority = 9;
@@ -124,7 +129,7 @@ void ProfileSaver::Run() {
     }
     total_ms_of_sleep_ += options_.GetSaveResolvedClassesDelayMs();
   }
-  FetchAndCacheResolvedClassesAndMethods(/*startup*/ true);
+  FetchAndCacheResolvedClassesAndMethods(/*startup=*/ true);
 
 
   // When we save without waiting for JIT notifications we use a simple
@@ -178,7 +183,7 @@ void ProfileSaver::Run() {
 
     uint16_t number_of_new_methods = 0;
     uint64_t start_work = NanoTime();
-    bool profile_saved_to_disk = ProcessProfilingInfo(/*force_save*/false, &number_of_new_methods);
+    bool profile_saved_to_disk = ProcessProfilingInfo(/*force_save=*/false, &number_of_new_methods);
     // Update the notification counter based on result. Note that there might be contention on this
     // but we don't care about to be 100% precise.
     if (!profile_saved_to_disk) {
@@ -250,7 +255,7 @@ class GetClassLoadersVisitor : public ClassLoaderVisitor {
         class_loaders_(class_loaders) {}
 
   void Visit(ObjPtr<mirror::ClassLoader> class_loader)
-      REQUIRES_SHARED(Locks::classlinker_classes_lock_, Locks::mutator_lock_) OVERRIDE {
+      REQUIRES_SHARED(Locks::classlinker_classes_lock_, Locks::mutator_lock_) override {
     class_loaders_->push_back(hs_->NewHandle(class_loader));
   }
 
@@ -269,7 +274,7 @@ class GetClassesVisitor : public ClassVisitor {
       : profile_boot_class_path_(profile_boot_class_path),
         out_(out) {}
 
-  virtual bool operator()(ObjPtr<mirror::Class> klass) REQUIRES_SHARED(Locks::mutator_lock_) {
+  bool operator()(ObjPtr<mirror::Class> klass) override REQUIRES_SHARED(Locks::mutator_lock_) {
     if (klass->IsProxyClass() ||
         klass->IsArrayClass() ||
         klass->IsPrimitive() ||
@@ -496,7 +501,7 @@ bool ProfileSaver::ProcessProfilingInfo(bool force_save, /*out*/uint16_t* number
 
   // We only need to do this once, not once per dex location.
   // TODO: Figure out a way to only do it when stuff has changed? It takes 30-50ms.
-  FetchAndCacheResolvedClassesAndMethods(/*startup*/ false);
+  FetchAndCacheResolvedClassesAndMethods(/*startup=*/ false);
 
   for (const auto& it : tracked_locations) {
     if (!force_save && ShuttingDown(Thread::Current())) {
@@ -516,7 +521,7 @@ bool ProfileSaver::ProcessProfilingInfo(bool force_save, /*out*/uint16_t* number
     }
     {
       ProfileCompilationInfo info(Runtime::Current()->GetArenaPool());
-      if (!info.Load(filename, /*clear_if_invalid*/ true)) {
+      if (!info.Load(filename, /*clear_if_invalid=*/ true)) {
         LOG(WARNING) << "Could not forcefully load profile " << filename;
         continue;
       }
@@ -602,9 +607,9 @@ void* ProfileSaver::RunProfileSaverThread(void* arg) {
   Runtime* runtime = Runtime::Current();
 
   bool attached = runtime->AttachCurrentThread("Profile Saver",
-                                               /*as_daemon*/true,
+                                               /*as_daemon=*/true,
                                                runtime->GetSystemThreadGroup(),
-                                               /*create_peer*/true);
+                                               /*create_peer=*/true);
   if (!attached) {
     CHECK(runtime->IsShuttingDown(Thread::Current()));
     return nullptr;
@@ -746,7 +751,7 @@ void ProfileSaver::Stop(bool dump_info) {
 
   // Force save everything before destroying the thread since we want profiler_pthread_ to remain
   // valid.
-  instance_->ProcessProfilingInfo(/*force_save*/true, /*number_of_new_methods*/nullptr);
+  instance_->ProcessProfilingInfo(/*force_save=*/true, /*number_of_new_methods=*/nullptr);
 
   // Wait for the saver thread to stop.
   CHECK_PTHREAD_CALL(pthread_join, (profiler_pthread, nullptr), "profile saver thread shutdown");
@@ -833,7 +838,7 @@ void ProfileSaver::ForceProcessProfiles() {
   // but we only use this in testing when we now this won't happen.
   // Refactor the way we handle the instance so that we don't end up in this situation.
   if (saver != nullptr) {
-    saver->ProcessProfilingInfo(/*force_save*/true, /*number_of_new_methods*/nullptr);
+    saver->ProcessProfilingInfo(/*force_save=*/true, /*number_of_new_methods=*/nullptr);
   }
 }
 
@@ -841,7 +846,7 @@ bool ProfileSaver::HasSeenMethod(const std::string& profile, bool hot, MethodRef
   MutexLock mu(Thread::Current(), *Locks::profiler_lock_);
   if (instance_ != nullptr) {
     ProfileCompilationInfo info(Runtime::Current()->GetArenaPool());
-    if (!info.Load(profile, /*clear_if_invalid*/false)) {
+    if (!info.Load(profile, /*clear_if_invalid=*/false)) {
       return false;
     }
     ProfileCompilationInfo::MethodHotness hotness = info.GetMethodHotness(ref);

@@ -59,8 +59,8 @@ static constexpr uint64_t kLongWaitMs = 100 * kDebugThresholdFudgeFactor;
  * though, because we have a full 32 bits to work with.
  *
  * The two states of an Object's lock are referred to as "thin" and "fat".  A lock may transition
- * from the "thin" state to the "fat" state and this transition is referred to as inflation. Once
- * a lock has been inflated it remains in the "fat" state indefinitely.
+ * from the "thin" state to the "fat" state and this transition is referred to as inflation. We
+ * deflate locks from time to time as part of heap trimming.
  *
  * The lock value itself is stored in mirror::Object::monitor_ and the representation is described
  * in the LockWord value type.
@@ -134,13 +134,15 @@ Monitor::Monitor(Thread* self, Thread* owner, mirror::Object* obj, int32_t hash_
 }
 
 int32_t Monitor::GetHashCode() {
-  while (!HasHashCode()) {
-    if (hash_code_.CompareAndSetWeakRelaxed(0, mirror::Object::GenerateIdentityHashCode())) {
-      break;
-    }
+  int32_t hc = hash_code_.load(std::memory_order_relaxed);
+  if (!HasHashCode()) {
+    // Use a strong CAS to prevent spurious failures since these can make the boot image
+    // non-deterministic.
+    hash_code_.CompareAndSetStrongRelaxed(0, mirror::Object::GenerateIdentityHashCode());
+    hc = hash_code_.load(std::memory_order_relaxed);
   }
   DCHECK(HasHashCode());
-  return hash_code_.LoadRelaxed();
+  return hc;
 }
 
 bool Monitor::Install(Thread* self) {
@@ -155,7 +157,7 @@ bool Monitor::Install(Thread* self) {
       break;
     }
     case LockWord::kHashCode: {
-      CHECK_EQ(hash_code_.LoadRelaxed(), static_cast<int32_t>(lw.GetHashCode()));
+      CHECK_EQ(hash_code_.load(std::memory_order_relaxed), static_cast<int32_t>(lw.GetHashCode()));
       break;
     }
     case LockWord::kFatLocked: {
@@ -173,7 +175,7 @@ bool Monitor::Install(Thread* self) {
   }
   LockWord fat(this, lw.GCState());
   // Publish the updated lock word, which may race with other threads.
-  bool success = GetObject()->CasLockWordWeakRelease(lw, fat);
+  bool success = GetObject()->CasLockWord(lw, fat, CASMode::kWeak, std::memory_order_release);
   // Lock profiling.
   if (success && owner_ != nullptr && lock_profiling_threshold_ != 0) {
     // Do not abort on dex pc errors. This can easily happen when we want to dump a stack trace on
@@ -182,7 +184,7 @@ bool Monitor::Install(Thread* self) {
     if (locking_method_ != nullptr && UNLIKELY(locking_method_->IsProxyMethod())) {
       // Grab another frame. Proxy methods are not helpful for lock profiling. This should be rare
       // enough that it's OK to walk the stack twice.
-      struct NextMethodVisitor FINAL : public StackVisitor {
+      struct NextMethodVisitor final : public StackVisitor {
         explicit NextMethodVisitor(Thread* thread) REQUIRES_SHARED(Locks::mutator_lock_)
             : StackVisitor(thread,
                            nullptr,
@@ -191,7 +193,7 @@ bool Monitor::Install(Thread* self) {
               count_(0),
               method_(nullptr),
               dex_pc_(0) {}
-        bool VisitFrame() OVERRIDE REQUIRES_SHARED(Locks::mutator_lock_) {
+        bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
           ArtMethod* m = GetMethod();
           if (m->IsRuntimeMethod()) {
             // Continue if this is a runtime method.
@@ -269,7 +271,7 @@ void Monitor::SetObject(mirror::Object* object) {
 
 // Note: Adapted from CurrentMethodVisitor in thread.cc. We must not resolve here.
 
-struct NthCallerWithDexPcVisitor FINAL : public StackVisitor {
+struct NthCallerWithDexPcVisitor final : public StackVisitor {
   explicit NthCallerWithDexPcVisitor(Thread* thread, size_t frame)
       REQUIRES_SHARED(Locks::mutator_lock_)
       : StackVisitor(thread, nullptr, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
@@ -277,7 +279,7 @@ struct NthCallerWithDexPcVisitor FINAL : public StackVisitor {
         dex_pc_(0),
         current_frame_number_(0),
         wanted_frame_number_(frame) {}
-  bool VisitFrame() OVERRIDE REQUIRES_SHARED(Locks::mutator_lock_) {
+  bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
     ArtMethod* m = GetMethod();
     if (m == nullptr || m->IsRuntimeMethod()) {
       // Runtime method, upcall, or resolution issue. Skip.
@@ -287,7 +289,7 @@ struct NthCallerWithDexPcVisitor FINAL : public StackVisitor {
     // Is this the requested frame?
     if (current_frame_number_ == wanted_frame_number_) {
       method_ = m;
-      dex_pc_ = GetDexPc(false /* abort_on_error*/);
+      dex_pc_ = GetDexPc(/* abort_on_failure=*/ false);
       return false;
     }
 
@@ -383,7 +385,7 @@ bool Monitor::TryLockLocked(Thread* self) {
   } else {
     return false;
   }
-  AtraceMonitorLock(self, GetObject(), false /* is_wait */);
+  AtraceMonitorLock(self, GetObject(), /* is_wait= */ false);
   return true;
 }
 
@@ -512,7 +514,7 @@ void Monitor::Lock(Thread* self) {
                 if (should_dump_stacks) {
                   // Very long contention. Dump stacks.
                   struct CollectStackTrace : public Closure {
-                    void Run(art::Thread* thread) OVERRIDE
+                    void Run(art::Thread* thread) override
                         REQUIRES_SHARED(art::Locks::mutator_lock_) {
                       thread->DumpJavaStack(oss);
                     }
@@ -775,7 +777,7 @@ void Monitor::Wait(Thread* self, int64_t ms, int32_t ns,
   AtraceMonitorUnlock();  // For the implict Unlock() just above. This will only end the deepest
                           // nesting, but that is enough for the visualization, and corresponds to
                           // the single Lock() we do afterwards.
-  AtraceMonitorLock(self, GetObject(), true /* is_wait */);
+  AtraceMonitorLock(self, GetObject(), /* is_wait= */ true);
 
   bool was_interrupted = false;
   bool timed_out = false;
@@ -1039,8 +1041,8 @@ mirror::Object* Monitor::MonitorEnter(Thread* self, mirror::Object* obj, bool tr
       case LockWord::kUnlocked: {
         // No ordering required for preceding lockword read, since we retest.
         LockWord thin_locked(LockWord::FromThinLockId(thread_id, 0, lock_word.GCState()));
-        if (h_obj->CasLockWordWeakAcquire(lock_word, thin_locked)) {
-          AtraceMonitorLock(self, h_obj.Get(), false /* is_wait */);
+        if (h_obj->CasLockWord(lock_word, thin_locked, CASMode::kWeak, std::memory_order_acquire)) {
+          AtraceMonitorLock(self, h_obj.Get(), /* is_wait= */ false);
           return h_obj.Get();  // Success!
         }
         continue;  // Go again.
@@ -1058,13 +1060,16 @@ mirror::Object* Monitor::MonitorEnter(Thread* self, mirror::Object* obj, bool tr
             // Only this thread pays attention to the count. Thus there is no need for stronger
             // than relaxed memory ordering.
             if (!kUseReadBarrier) {
-              h_obj->SetLockWord(thin_locked, false /* volatile */);
-              AtraceMonitorLock(self, h_obj.Get(), false /* is_wait */);
+              h_obj->SetLockWord(thin_locked, /* as_volatile= */ false);
+              AtraceMonitorLock(self, h_obj.Get(), /* is_wait= */ false);
               return h_obj.Get();  // Success!
             } else {
               // Use CAS to preserve the read barrier state.
-              if (h_obj->CasLockWordWeakRelaxed(lock_word, thin_locked)) {
-                AtraceMonitorLock(self, h_obj.Get(), false /* is_wait */);
+              if (h_obj->CasLockWord(lock_word,
+                                     thin_locked,
+                                     CASMode::kWeak,
+                                     std::memory_order_relaxed)) {
+                AtraceMonitorLock(self, h_obj.Get(), /* is_wait= */ false);
                 return h_obj.Get();  // Success!
               }
             }
@@ -1101,7 +1106,7 @@ mirror::Object* Monitor::MonitorEnter(Thread* self, mirror::Object* obj, bool tr
       case LockWord::kFatLocked: {
         // We should have done an acquire read of the lockword initially, to ensure
         // visibility of the monitor data structure. Use an explicit fence instead.
-        QuasiAtomic::ThreadFenceAcquire();
+        std::atomic_thread_fence(std::memory_order_acquire);
         Monitor* mon = lock_word.FatLockMonitor();
         if (trylock) {
           return mon->TryLock(self) ? h_obj.Get() : nullptr;
@@ -1165,7 +1170,7 @@ bool Monitor::MonitorExit(Thread* self, mirror::Object* obj) {
             return true;
           } else {
             // Use CAS to preserve the read barrier state.
-            if (h_obj->CasLockWordWeakRelease(lock_word, new_lw)) {
+            if (h_obj->CasLockWord(lock_word, new_lw, CASMode::kWeak, std::memory_order_release)) {
               AtraceMonitorUnlock();
               // Success!
               return true;
@@ -1396,7 +1401,10 @@ void Monitor::VisitLocks(StackVisitor* stack_visitor, void (*callback)(mirror::O
   // Ask the verifier for the dex pcs of all the monitor-enter instructions corresponding to
   // the locks held in this stack frame.
   std::vector<verifier::MethodVerifier::DexLockInfo> monitor_enter_dex_pcs;
-  verifier::MethodVerifier::FindLocksAtDexPc(m, dex_pc, &monitor_enter_dex_pcs);
+  verifier::MethodVerifier::FindLocksAtDexPc(m,
+                                             dex_pc,
+                                             &monitor_enter_dex_pcs,
+                                             Runtime::Current()->GetTargetSdkVersion());
   for (verifier::MethodVerifier::DexLockInfo& dex_lock_info : monitor_enter_dex_pcs) {
     // As a debug check, check that dex PC corresponds to a monitor-enter.
     if (kIsDebugBuild) {
@@ -1569,7 +1577,7 @@ class MonitorDeflateVisitor : public IsMarkedVisitor {
  public:
   MonitorDeflateVisitor() : self_(Thread::Current()), deflate_count_(0) {}
 
-  virtual mirror::Object* IsMarked(mirror::Object* object) OVERRIDE
+  mirror::Object* IsMarked(mirror::Object* object) override
       REQUIRES_SHARED(Locks::mutator_lock_) {
     if (Monitor::Deflate(self_, object)) {
       DCHECK_NE(object->GetLockWord(true).GetState(), LockWord::kFatLocked);

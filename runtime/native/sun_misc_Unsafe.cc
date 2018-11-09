@@ -27,12 +27,14 @@
 #include "base/quasi_atomic.h"
 #include "common_throws.h"
 #include "gc/accounting/card_table-inl.h"
-#include "jni_internal.h"
+#include "jni/jni_internal.h"
 #include "mirror/array.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
+#include "art_field-inl.h"
 #include "native_util.h"
 #include "scoped_fast_native_object_access-inl.h"
+#include "well_known_classes.h"
 
 namespace art {
 
@@ -41,9 +43,11 @@ static jboolean Unsafe_compareAndSwapInt(JNIEnv* env, jobject, jobject javaObj, 
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
   // JNI must use non transactional mode.
-  bool success = obj->CasFieldStrongSequentiallyConsistent32<false>(MemberOffset(offset),
-                                                                    expectedValue,
-                                                                    newValue);
+  bool success = obj->CasField32<false>(MemberOffset(offset),
+                                        expectedValue,
+                                        newValue,
+                                        CASMode::kStrong,
+                                        std::memory_order_seq_cst);
   return success ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -72,15 +76,17 @@ static jboolean Unsafe_compareAndSwapObject(JNIEnv* env, jobject, jobject javaOb
     mirror::HeapReference<mirror::Object>* field_addr =
         reinterpret_cast<mirror::HeapReference<mirror::Object>*>(
             reinterpret_cast<uint8_t*>(obj.Ptr()) + static_cast<size_t>(offset));
-    ReadBarrier::Barrier<mirror::Object, /* kIsVolatile */ false, kWithReadBarrier,
-        /* kAlwaysUpdateField */ true>(
+    ReadBarrier::Barrier<mirror::Object, /* kIsVolatile= */ false, kWithReadBarrier,
+        /* kAlwaysUpdateField= */ true>(
         obj.Ptr(),
         MemberOffset(offset),
         field_addr);
   }
-  bool success = obj->CasFieldStrongSequentiallyConsistentObject<false>(MemberOffset(offset),
-                                                                        expectedValue,
-                                                                        newValue);
+  bool success = obj->CasFieldObject<false>(MemberOffset(offset),
+                                            expectedValue,
+                                            newValue,
+                                            CASMode::kStrong,
+                                            std::memory_order_seq_cst);
   return success ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -116,7 +122,7 @@ static void Unsafe_putOrderedInt(JNIEnv* env, jobject, jobject javaObj, jlong of
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
   // TODO: A release store is likely to be faster on future processors.
-  QuasiAtomic::ThreadFenceRelease();
+  std::atomic_thread_fence(std::memory_order_release);
   // JNI must use non transactional mode.
   obj->SetField32<false>(MemberOffset(offset), newValue);
 }
@@ -152,7 +158,7 @@ static void Unsafe_putOrderedLong(JNIEnv* env, jobject, jobject javaObj, jlong o
                                   jlong newValue) {
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
-  QuasiAtomic::ThreadFenceRelease();
+  std::atomic_thread_fence(std::memory_order_release);
   // JNI must use non transactional mode.
   obj->SetField64<false>(MemberOffset(offset), newValue);
 }
@@ -194,7 +200,7 @@ static void Unsafe_putOrderedObject(JNIEnv* env, jobject, jobject javaObj, jlong
   ScopedFastNativeObjectAccess soa(env);
   ObjPtr<mirror::Object> obj = soa.Decode<mirror::Object>(javaObj);
   ObjPtr<mirror::Object> newValue = soa.Decode<mirror::Object>(javaNewValue);
-  QuasiAtomic::ThreadFenceRelease();
+  std::atomic_thread_fence(std::memory_order_release);
   // JNI must use non transactional mode.
   obj->SetFieldObject<false>(MemberOffset(offset), newValue);
 }
@@ -500,6 +506,33 @@ static void Unsafe_fullFence(JNIEnv*, jobject) {
   std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
+static void Unsafe_park(JNIEnv* env, jobject, jboolean isAbsolute, jlong time) {
+  ScopedObjectAccess soa(env);
+  Thread::Current()->Park(isAbsolute, time);
+}
+
+static void Unsafe_unpark(JNIEnv* env, jobject, jobject jthread) {
+  art::ScopedFastNativeObjectAccess soa(env);
+  if (jthread == nullptr || !env->IsInstanceOf(jthread, WellKnownClasses::java_lang_Thread)) {
+    ThrowIllegalArgumentException("Argument to unpark() was not a Thread");
+    return;
+  }
+  art::MutexLock mu(soa.Self(), *art::Locks::thread_list_lock_);
+  art::Thread* thread = art::Thread::FromManagedThread(soa, jthread);
+  if (thread != nullptr) {
+    thread->Unpark();
+  } else {
+    // If thread is null, that means that either the thread is not started yet,
+    // or the thread has already terminated. Setting the field to true will be
+    // respected when the thread does start, and is harmless if the thread has
+    // already terminated.
+    ArtField* unparked =
+        jni::DecodeArtField(WellKnownClasses::java_lang_Thread_unparkedBeforeStart);
+    // JNI must use non transactional mode.
+    unparked->SetBoolean<false>(soa.Decode<mirror::Object>(jthread), JNI_TRUE);
+  }
+}
+
 static JNINativeMethod gMethods[] = {
   FAST_NATIVE_METHOD(Unsafe, compareAndSwapInt, "(Ljava/lang/Object;JII)Z"),
   FAST_NATIVE_METHOD(Unsafe, compareAndSwapLong, "(Ljava/lang/Object;JJJ)Z"),
@@ -542,6 +575,8 @@ static JNINativeMethod gMethods[] = {
   FAST_NATIVE_METHOD(Unsafe, putShort, "(Ljava/lang/Object;JS)V"),
   FAST_NATIVE_METHOD(Unsafe, putFloat, "(Ljava/lang/Object;JF)V"),
   FAST_NATIVE_METHOD(Unsafe, putDouble, "(Ljava/lang/Object;JD)V"),
+  FAST_NATIVE_METHOD(Unsafe, unpark, "(Ljava/lang/Object;)V"),
+  NATIVE_METHOD(Unsafe, park, "(ZJ)V"),
 
   // Each of the getFoo variants are overloaded with a call that operates
   // directively on a native pointer.

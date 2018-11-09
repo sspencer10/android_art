@@ -38,7 +38,7 @@
 #include "gc/scoped_gc_critical_section.h"
 #include "gc/space/image_space.h"
 #include "handle_scope-inl.h"
-#include "jni_internal.h"
+#include "jni/jni_internal.h"
 #include "mirror/class_loader.h"
 #include "mirror/object-inl.h"
 #include "oat_file.h"
@@ -72,7 +72,6 @@ const OatFile* OatFileManager::RegisterOatFile(std::unique_ptr<const OatFile> oa
       CHECK_NE(oat_file->Begin(), existing->Begin()) << "Oat file already mapped at that location";
     }
   }
-  have_non_pic_oat_file_ = have_non_pic_oat_file_ || !oat_file->IsPic();
   const OatFile* ret = oat_file.get();
   oat_files_.insert(std::move(oat_file));
   return ret;
@@ -85,7 +84,7 @@ void OatFileManager::UnRegisterAndDeleteOatFile(const OatFile* oat_file) {
   auto it = oat_files_.find(compare);
   CHECK(it != oat_files_.end());
   oat_files_.erase(it);
-  compare.release();
+  compare.release();  // NOLINT b/117926937
 }
 
 const OatFile* OatFileManager::FindOpenedOatFileFromDexLocation(
@@ -143,7 +142,7 @@ const OatFile* OatFileManager::GetPrimaryOatFile() const {
 }
 
 OatFileManager::OatFileManager()
-    : have_non_pic_oat_file_(false), only_use_system_oat_files_(false) {}
+    : only_use_system_oat_files_(false) {}
 
 OatFileManager::~OatFileManager() {
   // Explicitly clear oat_files_ since the OatFile destructor calls back into OatFileManager for
@@ -152,7 +151,7 @@ OatFileManager::~OatFileManager() {
 }
 
 std::vector<const OatFile*> OatFileManager::RegisterImageOatFiles(
-    std::vector<gc::space::ImageSpace*> spaces) {
+    const std::vector<gc::space::ImageSpace*>& spaces) {
   std::vector<const OatFile*> oat_files;
   for (gc::space::ImageSpace* space : spaces) {
     oat_files.push_back(RegisterOatFile(space->ReleaseOatFile()));
@@ -182,7 +181,7 @@ class TypeIndexInfo {
 
  private:
   static BitVector GenerateTypeIndexes(const DexFile* dex_file) {
-    BitVector type_indexes(/*start_bits*/0, /*expandable*/true, Allocator::GetMallocAllocator());
+    BitVector type_indexes(/*start_bits=*/0, /*expandable=*/true, Allocator::GetMallocAllocator());
     for (uint16_t i = 0; i < dex_file->NumClassDefs(); ++i) {
       const DexFile::ClassDef& class_def = dex_file->GetClassDef(i);
       uint16_t type_idx = class_def.class_idx_.index_;
@@ -276,9 +275,19 @@ static void AddNext(/*inout*/DexFileAndClassPair& original,
   }
 }
 
-static bool CollisionCheck(std::vector<const DexFile*>& dex_files_loaded,
-                           std::vector<const DexFile*>& dex_files_unloaded,
-                           std::string* error_msg /*out*/) {
+static bool CheckClassCollision(const OatFile* oat_file,
+    const ClassLoaderContext* context,
+    std::string* error_msg /*out*/) {
+  std::vector<const DexFile*> dex_files_loaded = context->FlattenOpenedDexFiles();
+
+  // Vector that holds the newly opened dex files live, this is done to prevent leaks.
+  std::vector<std::unique_ptr<const DexFile>> opened_dex_files;
+
+  ScopedTrace st("Collision check");
+  // Add dex files from the oat file to check.
+  std::vector<const DexFile*> dex_files_unloaded;
+  AddDexFilesFromOat(oat_file, &dex_files_unloaded, &opened_dex_files);
+
   // Generate type index information for each dex file.
   std::vector<TypeIndexInfo> loaded_types;
   for (const DexFile* dex_file : dex_files_loaded) {
@@ -293,12 +302,12 @@ static bool CollisionCheck(std::vector<const DexFile*>& dex_files_loaded,
   std::priority_queue<DexFileAndClassPair> queue;
   for (size_t i = 0; i < dex_files_loaded.size(); ++i) {
     if (loaded_types[i].GetIterator() != loaded_types[i].GetIteratorEnd()) {
-      queue.emplace(dex_files_loaded[i], &loaded_types[i], /*from_loaded_oat*/true);
+      queue.emplace(dex_files_loaded[i], &loaded_types[i], /*from_loaded_oat=*/true);
     }
   }
   for (size_t i = 0; i < dex_files_unloaded.size(); ++i) {
     if (unloaded_types[i].GetIterator() != unloaded_types[i].GetIteratorEnd()) {
-      queue.emplace(dex_files_unloaded[i], &unloaded_types[i], /*from_loaded_oat*/false);
+      queue.emplace(dex_files_unloaded[i], &unloaded_types[i], /*from_loaded_oat=*/false);
     }
   }
 
@@ -355,9 +364,10 @@ static bool CollisionCheck(std::vector<const DexFile*>& dex_files_loaded,
 // against the following top element. If the descriptor is the same, it is now checked whether
 // the two elements agree on whether their dex file was from an already-loaded oat-file or the
 // new oat file. Any disagreement indicates a collision.
-bool OatFileManager::HasCollisions(const OatFile* oat_file,
-                                   const ClassLoaderContext* context,
-                                   std::string* error_msg /*out*/) const {
+OatFileManager::CheckCollisionResult OatFileManager::CheckCollision(
+    const OatFile* oat_file,
+    const ClassLoaderContext* context,
+    /*out*/ std::string* error_msg) const {
   DCHECK(oat_file != nullptr);
   DCHECK(error_msg != nullptr);
 
@@ -367,28 +377,59 @@ bool OatFileManager::HasCollisions(const OatFile* oat_file,
   // Note that this has correctness implications as we cannot guarantee that the class resolution
   // used during compilation is OK (b/37777332).
   if (context == nullptr) {
-      LOG(WARNING) << "Skipping duplicate class check due to unsupported classloader";
-      return false;
+    LOG(WARNING) << "Skipping duplicate class check due to unsupported classloader";
+    return CheckCollisionResult::kSkippedUnsupportedClassLoader;
   }
 
-  // If the pat file loading context matches the context used during compilation then we accept
+  // If the oat file loading context matches the context used during compilation then we accept
   // the oat file without addition checks
-  if (context->VerifyClassLoaderContextMatch(oat_file->GetClassLoaderContext())) {
-    return false;
+  ClassLoaderContext::VerificationResult result = context->VerifyClassLoaderContextMatch(
+      oat_file->GetClassLoaderContext(),
+      /*verify_names=*/ true,
+      /*verify_checksums=*/ true);
+  switch (result) {
+    case ClassLoaderContext::VerificationResult::kForcedToSkipChecks:
+      return CheckCollisionResult::kSkippedClassLoaderContextSharedLibrary;
+    case ClassLoaderContext::VerificationResult::kMismatch:
+      // Mismatched context, do the actual collision check.
+      break;
+    case ClassLoaderContext::VerificationResult::kVerifies:
+      return CheckCollisionResult::kNoCollisions;
   }
 
   // The class loader context does not match. Perform a full duplicate classes check.
+  return CheckClassCollision(oat_file, context, error_msg)
+      ? CheckCollisionResult::kPerformedHasCollisions : CheckCollisionResult::kNoCollisions;
+}
 
-  std::vector<const DexFile*> dex_files_loaded = context->FlattenOpenedDexFiles();
+bool OatFileManager::AcceptOatFile(CheckCollisionResult result) const {
+  // Take the file only if it has no collisions, or we must take it because of preopting.
+  // Also accept oat files for shared libraries and unsupported class loaders.
+  return result != CheckCollisionResult::kPerformedHasCollisions;
+}
 
-  // Vector that holds the newly opened dex files live, this is done to prevent leaks.
-  std::vector<std::unique_ptr<const DexFile>> opened_dex_files;
-
-  ScopedTrace st("Collision check");
-  // Add dex files from the oat file to check.
-  std::vector<const DexFile*> dex_files_unloaded;
-  AddDexFilesFromOat(oat_file, &dex_files_unloaded, &opened_dex_files);
-  return CollisionCheck(dex_files_loaded, dex_files_unloaded, error_msg);
+bool OatFileManager::ShouldLoadAppImage(CheckCollisionResult check_collision_result,
+                                        const OatFile* source_oat_file,
+                                        ClassLoaderContext* context,
+                                        std::string* error_msg) {
+  Runtime* const runtime = Runtime::Current();
+  if (kEnableAppImage && (!runtime->IsJavaDebuggable() || source_oat_file->IsDebuggable())) {
+    // If we verified the class loader context (skipping due to the special marker doesn't
+    // count), then also avoid the collision check.
+    bool load_image = check_collision_result == CheckCollisionResult::kNoCollisions;
+    // If we skipped the collision check, we need to reverify to be sure its OK to load the
+    // image.
+    if (!load_image &&
+        check_collision_result ==
+            CheckCollisionResult::kSkippedClassLoaderContextSharedLibrary) {
+      // We can load the app image only if there are no collisions. If we know the
+      // class loader but didn't do the full collision check in HasCollisions(),
+      // do it now. b/77342775
+      load_image = !CheckClassCollision(source_oat_file, context, error_msg);
+    }
+    return load_image;
+  }
+  return false;
 }
 
 std::vector<std::unique_ptr<const DexFile>> OatFileManager::OpenDexFilesFromOat(
@@ -423,66 +464,25 @@ std::vector<std::unique_ptr<const DexFile>> OatFileManager::OpenDexFilesFromOat(
                                       !runtime->IsAotCompiler(),
                                       only_use_system_oat_files_);
 
-  // Lock the target oat location to avoid races generating and loading the
-  // oat file.
-  std::string error_msg;
-  if (!oat_file_assistant.Lock(/*out*/&error_msg)) {
-    // Don't worry too much if this fails. If it does fail, it's unlikely we
-    // can generate an oat file anyway.
-    VLOG(class_linker) << "OatFileAssistant::Lock: " << error_msg;
-  }
-
-  const OatFile* source_oat_file = nullptr;
-
-  if (!oat_file_assistant.IsUpToDate()) {
-    // Update the oat file on disk if we can, based on the --compiler-filter
-    // option derived from the current runtime options.
-    // This may fail, but that's okay. Best effort is all that matters here.
-    // TODO(calin): b/64530081 b/66984396. Pass a null context to verify and compile
-    // secondary dex files in isolation (and avoid to extract/verify the main apk
-    // if it's in the class path). Note this trades correctness for performance
-    // since the resulting slow down is unacceptable in some cases until b/64530081
-    // is fixed.
-    // We still pass the class loader context when the classpath string of the runtime
-    // is not empty, which is the situation when ART is invoked standalone.
-    ClassLoaderContext* actual_context = Runtime::Current()->GetClassPathString().empty()
-        ? nullptr
-        : context.get();
-    switch (oat_file_assistant.MakeUpToDate(/*profile_changed*/ false,
-                                            actual_context,
-                                            /*out*/ &error_msg)) {
-      case OatFileAssistant::kUpdateFailed:
-        LOG(WARNING) << error_msg;
-        break;
-
-      case OatFileAssistant::kUpdateNotAttempted:
-        // Avoid spamming the logs if we decided not to attempt making the oat
-        // file up to date.
-        VLOG(oat) << error_msg;
-        break;
-
-      case OatFileAssistant::kUpdateSucceeded:
-        // Nothing to do.
-        break;
-    }
-  }
-
   // Get the oat file on disk.
   std::unique_ptr<const OatFile> oat_file(oat_file_assistant.GetBestOatFile().release());
   VLOG(oat) << "OatFileAssistant(" << dex_location << ").GetBestOatFile()="
             << reinterpret_cast<uintptr_t>(oat_file.get())
             << " (executable=" << (oat_file != nullptr ? oat_file->IsExecutable() : false) << ")";
 
+  const OatFile* source_oat_file = nullptr;
+  CheckCollisionResult check_collision_result = CheckCollisionResult::kPerformedHasCollisions;
+  std::string error_msg;
   if ((class_loader != nullptr || dex_elements != nullptr) && oat_file != nullptr) {
     // Prevent oat files from being loaded if no class_loader or dex_elements are provided.
     // This can happen when the deprecated DexFile.<init>(String) is called directly, and it
     // could load oat files without checking the classpath, which would be incorrect.
     // Take the file only if it has no collisions, or we must take it because of preopting.
-    bool accept_oat_file =
-        !HasCollisions(oat_file.get(), context.get(), /*out*/ &error_msg);
+    check_collision_result = CheckCollision(oat_file.get(), context.get(), /*out*/ &error_msg);
+    bool accept_oat_file = AcceptOatFile(check_collision_result);
     if (!accept_oat_file) {
       // Failed the collision check. Print warning.
-      if (Runtime::Current()->IsDexFileFallbackEnabled()) {
+      if (runtime->IsDexFileFallbackEnabled()) {
         if (!oat_file_assistant.HasOriginalDexFiles()) {
           // We need to fallback but don't have original dex files. We have to
           // fallback to opening the existing oat file. This is potentially
@@ -526,13 +526,16 @@ std::vector<std::unique_ptr<const DexFile>> OatFileManager::OpenDexFilesFromOat(
   if (source_oat_file != nullptr) {
     bool added_image_space = false;
     if (source_oat_file->IsExecutable()) {
+      ScopedTrace app_image_timing("AppImage:Loading");
+
       // We need to throw away the image space if we are debuggable but the oat-file source of the
       // image is not otherwise we might get classes with inlined methods or other such things.
       std::unique_ptr<gc::space::ImageSpace> image_space;
-      if (kEnableAppImage && (!runtime->IsJavaDebuggable() || source_oat_file->IsDebuggable())) {
+      if (ShouldLoadAppImage(check_collision_result,
+                             source_oat_file,
+                             context.get(),
+                             &error_msg)) {
         image_space = oat_file_assistant.OpenImageSpace(source_oat_file);
-      } else {
-        image_space = nullptr;
       }
       if (image_space != nullptr) {
         ScopedObjectAccess soa(self);
@@ -564,7 +567,7 @@ std::vector<std::unique_ptr<const DexFile>> OatFileManager::OpenDexFilesFromOat(
           if (added_image_space) {
             // Successfully added image space to heap, release the map so that it does not get
             // freed.
-            image_space.release();
+            image_space.release();  // NOLINT b/117926937
 
             // Register for tracking.
             for (const auto& dex_file : dex_files) {

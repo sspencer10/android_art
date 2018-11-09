@@ -16,6 +16,7 @@
 
 #include "native_stack_dump.h"
 
+#include <memory>
 #include <ostream>
 
 #include <stdio.h>
@@ -128,10 +129,10 @@ static std::unique_ptr<Addr2linePipe> Connect(const std::string& name, const cha
   } else {
     close(caller_to_addr2line[0]);
     close(addr2line_to_caller[1]);
-    return std::unique_ptr<Addr2linePipe>(new Addr2linePipe(addr2line_to_caller[0],
-                                                            caller_to_addr2line[1],
-                                                            name,
-                                                            pid));
+    return std::make_unique<Addr2linePipe>(addr2line_to_caller[0],
+                                           caller_to_addr2line[1],
+                                           name,
+                                           pid);
   }
 }
 
@@ -289,10 +290,7 @@ void DumpNativeStack(std::ostream& os,
                      ArtMethod* current_method,
                      void* ucontext_ptr,
                      bool skip_frames) {
-  // b/18119146
-  if (RUNNING_ON_MEMORY_TOOL != 0) {
-    return;
-  }
+  // Historical note: This was disabled when running under Valgrind (b/18119146).
 
   BacktraceMap* map = existing_map;
   std::unique_ptr<BacktraceMap> tmp_map;
@@ -375,7 +373,7 @@ void DumpNativeStack(std::ostream& os,
     }
     os << std::endl;
     if (try_addr2line && use_addr2line) {
-      Addr2line(it->map.name, it->pc - it->map.start, os, prefix, &addr2line_state);
+      Addr2line(it->map.name, it->rel_pc, os, prefix, &addr2line_state);
     }
   }
 

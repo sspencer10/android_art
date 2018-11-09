@@ -45,6 +45,7 @@
 #include "android-base/logging.h"
 #include "android-base/stringprintf.h"
 
+#include "dex/class_accessor-inl.h"
 #include "dex/code_item_accessors-inl.h"
 #include "dex/dex_file-inl.h"
 #include "dex/dex_file_exception_helpers.h"
@@ -68,14 +69,14 @@ FILE* gOutFile = stdout;
 /*
  * Data types that match the definitions in the VM specification.
  */
-typedef uint8_t  u1;
-typedef uint16_t u2;
-typedef uint32_t u4;
-typedef uint64_t u8;
-typedef int8_t   s1;
-typedef int16_t  s2;
-typedef int32_t  s4;
-typedef int64_t  s8;
+using u1 = uint8_t;
+using u2 = uint16_t;
+using u4 = uint32_t;
+using u8 = uint64_t;
+using s1 = int8_t;
+using s2 = int16_t;
+using s4 = int32_t;
+using s8 = int64_t;
 
 /*
  * Basic information about a field or a method.
@@ -122,8 +123,7 @@ static const char* primitiveTypeLabel(char typeChar) {
 /*
  * Converts a type descriptor to human-readable "dotted" form.  For
  * example, "Ljava/lang/String;" becomes "java.lang.String", and
- * "[I" becomes "int[]".  Also converts '$' to '.', which means this
- * form can't be converted back to a descriptor.
+ * "[I" becomes "int[]".
  */
 static std::unique_ptr<char[]> descriptorToDot(const char* str) {
   int targetLen = strlen(str);
@@ -156,7 +156,7 @@ static std::unique_ptr<char[]> descriptorToDot(const char* str) {
   int i = 0;
   for (; i < targetLen; i++) {
     const char ch = str[offset + i];
-    newStr[i] = (ch == '/' || ch == '$') ? '.' : ch;
+    newStr[i] = (ch == '/') ? '.' : ch;
   }  // for
 
   // Add the appropriate number of brackets for arrays.
@@ -170,10 +170,9 @@ static std::unique_ptr<char[]> descriptorToDot(const char* str) {
 }
 
 /*
- * Converts the class name portion of a type descriptor to human-readable
- * "dotted" form. For example, "Ljava/lang/String;" becomes "String".
+ * Retrieves the class name portion of a type descriptor.
  */
-static std::unique_ptr<char[]> descriptorClassToDot(const char* str) {
+static std::unique_ptr<char[]> descriptorClassToName(const char* str) {
   // Reduce to just the class name prefix.
   const char* lastSlash = strrchr(str, '/');
   if (lastSlash == nullptr) {
@@ -186,8 +185,7 @@ static std::unique_ptr<char[]> descriptorClassToDot(const char* str) {
   const int targetLen = strlen(lastSlash);
   std::unique_ptr<char[]> newStr(new char[targetLen]);
   for (int i = 0; i < targetLen - 1; i++) {
-    const char ch = lastSlash[i];
-    newStr[i] = ch == '$' ? '.' : ch;
+    newStr[i] = lastSlash[i];
   }  // for
   newStr[targetLen - 1] = '\0';
   return newStr;
@@ -333,7 +331,7 @@ static char* createAccessFlagStr(u4 flags, AccessFor forWhat) {
  * NULL-terminated.
  */
 static void asciify(char* out, const unsigned char* data, size_t len) {
-  while (len--) {
+  for (; len != 0u; --len) {
     if (*data < 0x20) {
       // Could do more here, but we don't need them yet.
       switch (*data) {
@@ -611,19 +609,11 @@ static void dumpClassDef(const DexFile* pDexFile, int idx) {
           pClassDef.class_data_off_, pClassDef.class_data_off_);
 
   // Fields and methods.
-  const u1* pEncodedData = pDexFile->GetClassData(pClassDef);
-  if (pEncodedData != nullptr) {
-    ClassDataItemIterator pClassData(*pDexFile, pEncodedData);
-    fprintf(gOutFile, "static_fields_size  : %d\n", pClassData.NumStaticFields());
-    fprintf(gOutFile, "instance_fields_size: %d\n", pClassData.NumInstanceFields());
-    fprintf(gOutFile, "direct_methods_size : %d\n", pClassData.NumDirectMethods());
-    fprintf(gOutFile, "virtual_methods_size: %d\n", pClassData.NumVirtualMethods());
-  } else {
-    fprintf(gOutFile, "static_fields_size  : 0\n");
-    fprintf(gOutFile, "instance_fields_size: 0\n");
-    fprintf(gOutFile, "direct_methods_size : 0\n");
-    fprintf(gOutFile, "virtual_methods_size: 0\n");
-  }
+  ClassAccessor accessor(*pDexFile, idx);
+  fprintf(gOutFile, "static_fields_size  : %d\n", accessor.NumStaticFields());
+  fprintf(gOutFile, "instance_fields_size: %d\n", accessor.NumInstanceFields());
+  fprintf(gOutFile, "direct_methods_size : %d\n", accessor.NumDirectMethods());
+  fprintf(gOutFile, "virtual_methods_size: %d\n", accessor.NumVirtualMethods());
   fprintf(gOutFile, "\n");
 }
 
@@ -761,24 +751,6 @@ static void dumpCatches(const DexFile* pDexFile, const DexFile::CodeItem* pCode)
 }
 
 /*
- * Callback for dumping each positions table entry.
- */
-static bool dumpPositionsCb(void* /*context*/, const DexFile::PositionInfo& entry) {
-  fprintf(gOutFile, "        0x%04x line=%d\n", entry.address_, entry.line_);
-  return false;
-}
-
-/*
- * Callback for dumping locals table entry.
- */
-static void dumpLocalsCb(void* /*context*/, const DexFile::LocalInfo& entry) {
-  const char* signature = entry.signature_ != nullptr ? entry.signature_ : "";
-  fprintf(gOutFile, "        0x%04x - 0x%04x reg=%d %s %s %s\n",
-          entry.start_address_, entry.end_address_, entry.reg_,
-          entry.name_, entry.descriptor_, signature);
-}
-
-/*
  * Helper for dumpInstruction(), which builds the string
  * representation for the index in the given instruction.
  * Returns a pointer to a buffer of sufficient size.
@@ -786,11 +758,10 @@ static void dumpLocalsCb(void* /*context*/, const DexFile::LocalInfo& entry) {
 static std::unique_ptr<char[]> indexString(const DexFile* pDexFile,
                                            const Instruction* pDecInsn,
                                            size_t bufSize) {
-  static const u4 kInvalidIndex = std::numeric_limits<u4>::max();
   std::unique_ptr<char[]> buf(new char[bufSize]);
   // Determine index and width of the string.
   u4 index = 0;
-  u4 secondary_index = kInvalidIndex;
+  u2 secondary_index = 0;
   u4 width = 4;
   switch (Instruction::FormatOf(pDecInsn->Opcode())) {
     // SOME NOT SUPPORTED:
@@ -898,7 +869,7 @@ static std::unique_ptr<char[]> indexString(const DexFile* pDexFile,
                                              signature.ToString().c_str());
       }
       if (secondary_index < pDexFile->GetHeader().proto_ids_size_) {
-        const DexFile::ProtoId& protoId = pDexFile->GetProtoId(secondary_index);
+        const DexFile::ProtoId& protoId = pDexFile->GetProtoId(dex::ProtoIndex(secondary_index));
         const Signature signature = pDexFile->GetProtoSignature(protoId);
         proto = signature.ToString();
       }
@@ -916,7 +887,7 @@ static std::unique_ptr<char[]> indexString(const DexFile* pDexFile,
       break;
     case Instruction::kIndexProtoRef:
       if (index < pDexFile->GetHeader().proto_ids_size_) {
-        const DexFile::ProtoId& protoId = pDexFile->GetProtoId(index);
+        const DexFile::ProtoId& protoId = pDexFile->GetProtoId(dex::ProtoIndex(index));
         const Signature signature = pDexFile->GetProtoSignature(protoId);
         const std::string& proto = signature.ToString();
         outSize = snprintf(buf.get(), bufSize, "%s // proto@%0*x", proto.c_str(), width, index);
@@ -1212,26 +1183,42 @@ static void dumpCode(const DexFile* pDexFile, u4 idx, u4 flags,
   // Positions and locals table in the debug info.
   bool is_static = (flags & kAccStatic) != 0;
   fprintf(gOutFile, "      positions     : \n");
-  pDexFile->DecodeDebugPositionInfo(accessor.DebugInfoOffset(), dumpPositionsCb, nullptr);
+  accessor.DecodeDebugPositionInfo([&](const DexFile::PositionInfo& entry) {
+    fprintf(gOutFile, "        0x%04x line=%d\n", entry.address_, entry.line_);
+    return false;
+  });
   fprintf(gOutFile, "      locals        : \n");
-  accessor.DecodeDebugLocalInfo(is_static, idx, dumpLocalsCb, nullptr);
+  accessor.DecodeDebugLocalInfo(is_static,
+                                idx,
+                                [&](const DexFile::LocalInfo& entry) {
+    const char* signature = entry.signature_ != nullptr ? entry.signature_ : "";
+    fprintf(gOutFile,
+            "        0x%04x - 0x%04x reg=%d %s %s %s\n",
+            entry.start_address_,
+            entry.end_address_,
+            entry.reg_,
+            entry.name_,
+            entry.descriptor_,
+            signature);
+  });
 }
 
 /*
  * Dumps a method.
  */
-static void dumpMethod(const DexFile* pDexFile, u4 idx, u4 flags,
-                       const DexFile::CodeItem* pCode, u4 codeOffset, int i) {
+static void dumpMethod(const ClassAccessor::Method& method, int i) {
   // Bail for anything private if export only requested.
+  const uint32_t flags = method.GetAccessFlags();
   if (gOptions.exportsOnly && (flags & (kAccPublic | kAccProtected)) == 0) {
     return;
   }
 
-  const DexFile::MethodId& pMethodId = pDexFile->GetMethodId(idx);
-  const char* name = pDexFile->StringDataByIdx(pMethodId.name_idx_);
-  const Signature signature = pDexFile->GetMethodSignature(pMethodId);
+  const DexFile& dex_file = method.GetDexFile();
+  const DexFile::MethodId& pMethodId = dex_file.GetMethodId(method.GetIndex());
+  const char* name = dex_file.StringDataByIdx(pMethodId.name_idx_);
+  const Signature signature = dex_file.GetMethodSignature(pMethodId);
   char* typeDescriptor = strdup(signature.ToString().c_str());
-  const char* backDescriptor = pDexFile->StringByTypeIdx(pMethodId.class_idx_);
+  const char* backDescriptor = dex_file.StringByTypeIdx(pMethodId.class_idx_);
   char* accessStr = createAccessFlagStr(flags, kAccessForMethod);
 
   if (gOptions.outputFormat == OUTPUT_PLAIN) {
@@ -1239,11 +1226,15 @@ static void dumpMethod(const DexFile* pDexFile, u4 idx, u4 flags,
     fprintf(gOutFile, "      name          : '%s'\n", name);
     fprintf(gOutFile, "      type          : '%s'\n", typeDescriptor);
     fprintf(gOutFile, "      access        : 0x%04x (%s)\n", flags, accessStr);
-    if (pCode == nullptr) {
+    if (method.GetCodeItem() == nullptr) {
       fprintf(gOutFile, "      code          : (none)\n");
     } else {
       fprintf(gOutFile, "      code          -\n");
-      dumpCode(pDexFile, idx, flags, pCode, codeOffset);
+      dumpCode(&dex_file,
+               method.GetIndex(),
+               flags,
+               method.GetCodeItem(),
+               method.GetCodeItemOffset());
     }
     if (gOptions.disassemble) {
       fputc('\n', gOutFile);
@@ -1253,7 +1244,7 @@ static void dumpMethod(const DexFile* pDexFile, u4 idx, u4 flags,
 
     // Method name and prototype.
     if (constructor) {
-      std::unique_ptr<char[]> dot(descriptorClassToDot(backDescriptor));
+      std::unique_ptr<char[]> dot(descriptorClassToName(backDescriptor));
       fprintf(gOutFile, "<constructor name=\"%s\"\n", dot.get());
       dot = descriptorToDot(backDescriptor);
       fprintf(gOutFile, " type=\"%s\"\n", dot.get());
@@ -1324,18 +1315,20 @@ static void dumpMethod(const DexFile* pDexFile, u4 idx, u4 flags,
 }
 
 /*
- * Dumps a static (class) field.
+ * Dumps a static or instance (class) field.
  */
-static void dumpSField(const DexFile* pDexFile, u4 idx, u4 flags, int i, const u1** data) {
+static void dumpField(const ClassAccessor::Field& field, int i, const u1** data = nullptr) {
   // Bail for anything private if export only requested.
+  const uint32_t flags = field.GetAccessFlags();
   if (gOptions.exportsOnly && (flags & (kAccPublic | kAccProtected)) == 0) {
     return;
   }
 
-  const DexFile::FieldId& pFieldId = pDexFile->GetFieldId(idx);
-  const char* name = pDexFile->StringDataByIdx(pFieldId.name_idx_);
-  const char* typeDescriptor = pDexFile->StringByTypeIdx(pFieldId.type_idx_);
-  const char* backDescriptor = pDexFile->StringByTypeIdx(pFieldId.class_idx_);
+  const DexFile& dex_file = field.GetDexFile();
+  const DexFile::FieldId& field_id = dex_file.GetFieldId(field.GetIndex());
+  const char* name = dex_file.StringDataByIdx(field_id.name_idx_);
+  const char* typeDescriptor = dex_file.StringByTypeIdx(field_id.type_idx_);
+  const char* backDescriptor = dex_file.StringByTypeIdx(field_id.class_idx_);
   char* accessStr = createAccessFlagStr(flags, kAccessForField);
 
   if (gOptions.outputFormat == OUTPUT_PLAIN) {
@@ -1345,7 +1338,7 @@ static void dumpSField(const DexFile* pDexFile, u4 idx, u4 flags, int i, const u
     fprintf(gOutFile, "      access        : 0x%04x (%s)\n", flags, accessStr);
     if (data != nullptr) {
       fputs("      value         : ", gOutFile);
-      dumpEncodedValue(pDexFile, data);
+      dumpEncodedValue(&dex_file, data);
       fputs("\n", gOutFile);
     }
   } else if (gOptions.outputFormat == OUTPUT_XML) {
@@ -1361,7 +1354,7 @@ static void dumpSField(const DexFile* pDexFile, u4 idx, u4 flags, int i, const u
     fprintf(gOutFile, " visibility=%s\n", quotedVisibility(flags));
     if (data != nullptr) {
       fputs(" value=\"", gOutFile);
-      dumpEncodedValue(pDexFile, data);
+      dumpEncodedValue(&dex_file, data);
       fputs("\"\n", gOutFile);
     }
     fputs(">\n</field>\n", gOutFile);
@@ -1371,41 +1364,16 @@ static void dumpSField(const DexFile* pDexFile, u4 idx, u4 flags, int i, const u
 }
 
 /*
- * Dumps an instance field.
+ * Dumping a CFG.
  */
-static void dumpIField(const DexFile* pDexFile, u4 idx, u4 flags, int i) {
-  dumpSField(pDexFile, idx, flags, i, nullptr);
-}
-
-/*
- * Dumping a CFG. Note that this will do duplicate work. utils.h doesn't expose the code-item
- * version, so the DumpMethodCFG code will have to iterate again to find it. But dexdump is a
- * tool, so this is not performance-critical.
- */
-
-static void dumpCfg(const DexFile* dex_file,
-                    u4 dex_method_idx,
-                    const DexFile::CodeItem* code_item) {
-  if (code_item != nullptr) {
-    std::ostringstream oss;
-    DumpMethodCFG(dex_file, dex_method_idx, oss);
-    fputs(oss.str().c_str(), gOutFile);
-  }
-}
-
 static void dumpCfg(const DexFile* dex_file, int idx) {
-  const DexFile::ClassDef& class_def = dex_file->GetClassDef(idx);
-  const u1* class_data = dex_file->GetClassData(class_def);
-  if (class_data == nullptr) {  // empty class such as a marker interface?
-    return;
-  }
-  ClassDataItemIterator it(*dex_file, class_data);
-  it.SkipAllFields();
-  while (it.HasNextMethod()) {
-    dumpCfg(dex_file,
-            it.GetMemberIndex(),
-            it.GetMethodCodeItem());
-    it.Next();
+  ClassAccessor accessor(*dex_file, dex_file->GetClassDef(idx));
+  for (const ClassAccessor::Method& method : accessor.GetMethods()) {
+    if (method.GetCodeItem() != nullptr) {
+      std::ostringstream oss;
+      DumpMethodCFG(method, oss);
+      fputs(oss.str().c_str(), gOutFile);
+    }
   }
 }
 
@@ -1495,7 +1463,7 @@ static void dumpClass(const DexFile* pDexFile, int idx, char** pLastPackage) {
     }
     fprintf(gOutFile, "  Interfaces        -\n");
   } else {
-    std::unique_ptr<char[]> dot(descriptorClassToDot(classDescriptor));
+    std::unique_ptr<char[]> dot(descriptorClassToName(classDescriptor));
     fprintf(gOutFile, "<class name=\"%s\"\n", dot.get());
     if (superclassDescriptor != nullptr) {
       dot = descriptorToDot(superclassDescriptor);
@@ -1520,65 +1488,50 @@ static void dumpClass(const DexFile* pDexFile, int idx, char** pLastPackage) {
   }
 
   // Fields and methods.
-  const u1* pEncodedData = pDexFile->GetClassData(pClassDef);
-  if (pEncodedData == nullptr) {
-    if (gOptions.outputFormat == OUTPUT_PLAIN) {
-      fprintf(gOutFile, "  Static fields     -\n");
-      fprintf(gOutFile, "  Instance fields   -\n");
-      fprintf(gOutFile, "  Direct methods    -\n");
-      fprintf(gOutFile, "  Virtual methods   -\n");
-    }
-  } else {
-    ClassDataItemIterator pClassData(*pDexFile, pEncodedData);
+  ClassAccessor accessor(*pDexFile, pClassDef);
 
-    // Prepare data for static fields.
-    const u1* sData = pDexFile->GetEncodedStaticFieldValuesArray(pClassDef);
-    const u4 sSize = sData != nullptr ? DecodeUnsignedLeb128(&sData) : 0;
+  // Prepare data for static fields.
+  const u1* sData = pDexFile->GetEncodedStaticFieldValuesArray(pClassDef);
+  const u4 sSize = sData != nullptr ? DecodeUnsignedLeb128(&sData) : 0;
 
-    // Static fields.
-    if (gOptions.outputFormat == OUTPUT_PLAIN) {
-      fprintf(gOutFile, "  Static fields     -\n");
-    }
-    for (u4 i = 0; pClassData.HasNextStaticField(); i++, pClassData.Next()) {
-      dumpSField(pDexFile,
-                 pClassData.GetMemberIndex(),
-                 pClassData.GetRawMemberAccessFlags(),
-                 i,
-                 i < sSize ? &sData : nullptr);
-    }  // for
+  // Static fields.
+  if (gOptions.outputFormat == OUTPUT_PLAIN) {
+    fprintf(gOutFile, "  Static fields     -\n");
+  }
+  uint32_t i = 0u;
+  for (const ClassAccessor::Field& field : accessor.GetStaticFields()) {
+    dumpField(field, i, i < sSize ? &sData : nullptr);
+    ++i;
+  }
 
-    // Instance fields.
-    if (gOptions.outputFormat == OUTPUT_PLAIN) {
-      fprintf(gOutFile, "  Instance fields   -\n");
-    }
-    for (u4 i = 0; pClassData.HasNextInstanceField(); i++, pClassData.Next()) {
-      dumpIField(pDexFile,
-                 pClassData.GetMemberIndex(),
-                 pClassData.GetRawMemberAccessFlags(),
-                 i);
-    }  // for
+  // Instance fields.
+  if (gOptions.outputFormat == OUTPUT_PLAIN) {
+    fprintf(gOutFile, "  Instance fields   -\n");
+  }
+  i = 0u;
+  for (const ClassAccessor::Field& field : accessor.GetInstanceFields()) {
+    dumpField(field, i);
+    ++i;
+  }
 
-    // Direct methods.
-    if (gOptions.outputFormat == OUTPUT_PLAIN) {
-      fprintf(gOutFile, "  Direct methods    -\n");
-    }
-    for (int i = 0; pClassData.HasNextDirectMethod(); i++, pClassData.Next()) {
-      dumpMethod(pDexFile, pClassData.GetMemberIndex(),
-                           pClassData.GetRawMemberAccessFlags(),
-                           pClassData.GetMethodCodeItem(),
-                           pClassData.GetMethodCodeItemOffset(), i);
-    }  // for
+  // Direct methods.
+  if (gOptions.outputFormat == OUTPUT_PLAIN) {
+    fprintf(gOutFile, "  Direct methods    -\n");
+  }
+  i = 0u;
+  for (const ClassAccessor::Method& method : accessor.GetDirectMethods()) {
+    dumpMethod(method, i);
+    ++i;
+  }
 
-    // Virtual methods.
-    if (gOptions.outputFormat == OUTPUT_PLAIN) {
-      fprintf(gOutFile, "  Virtual methods   -\n");
-    }
-    for (int i = 0; pClassData.HasNextVirtualMethod(); i++, pClassData.Next()) {
-      dumpMethod(pDexFile, pClassData.GetMemberIndex(),
-                           pClassData.GetRawMemberAccessFlags(),
-                           pClassData.GetMethodCodeItem(),
-                           pClassData.GetMethodCodeItemOffset(), i);
-    }  // for
+  // Virtual methods.
+  if (gOptions.outputFormat == OUTPUT_PLAIN) {
+    fprintf(gOutFile, "  Virtual methods   -\n");
+  }
+  i = 0u;
+  for (const ClassAccessor::Method& method : accessor.GetVirtualMethods()) {
+    dumpMethod(method, i);
+    ++i;
   }
 
   // End of class.
@@ -1705,7 +1658,7 @@ static void dumpCallSite(const DexFile* pDexFile, u4 idx) {
   dex::StringIndex method_name_idx = static_cast<dex::StringIndex>(it.GetJavaValue().i);
   const char* method_name = pDexFile->StringDataByIdx(method_name_idx);
   it.Next();
-  uint32_t method_type_idx = static_cast<uint32_t>(it.GetJavaValue().i);
+  dex::ProtoIndex method_type_idx = static_cast<dex::ProtoIndex>(it.GetJavaValue().i);
   const DexFile::ProtoId& method_type_id = pDexFile->GetProtoId(method_type_idx);
   std::string method_type = pDexFile->GetProtoSignature(method_type_id).ToString();
   it.Next();
@@ -1763,7 +1716,7 @@ static void dumpCallSite(const DexFile* pDexFile, u4 idx) {
         break;
       case EncodedArrayValueIterator::ValueType::kMethodType: {
         type = "MethodType";
-        uint32_t proto_idx = static_cast<uint32_t>(it.GetJavaValue().i);
+        dex::ProtoIndex proto_idx = static_cast<dex::ProtoIndex>(it.GetJavaValue().i);
         const DexFile::ProtoId& proto_id = pDexFile->GetProtoId(proto_idx);
         value = pDexFile->GetProtoSignature(proto_id).ToString();
         break;
@@ -1781,9 +1734,8 @@ static void dumpCallSite(const DexFile* pDexFile, u4 idx) {
       case EncodedArrayValueIterator::ValueType::kType: {
         type = "Class";
         dex::TypeIndex type_idx = static_cast<dex::TypeIndex>(it.GetJavaValue().i);
-        const DexFile::ClassDef* class_def = pDexFile->FindClassDef(type_idx);
-        value = pDexFile->GetClassDescriptor(*class_def);
-        value = descriptorClassToDot(value.c_str()).get();
+        const DexFile::TypeId& type_id = pDexFile->GetTypeId(type_idx);
+        value = pDexFile->GetTypeDescriptor(type_id);
         break;
       }
       case EncodedArrayValueIterator::ValueType::kField:
@@ -1848,18 +1800,18 @@ static void processDexFile(const char* fileName,
   // Iterate over all classes.
   char* package = nullptr;
   const u4 classDefsSize = pDexFile->GetHeader().class_defs_size_;
-  for (u4 i = 0; i < classDefsSize; i++) {
-    dumpClass(pDexFile, i, &package);
+  for (u4 j = 0; j < classDefsSize; j++) {
+    dumpClass(pDexFile, j, &package);
   }  // for
 
   // Iterate over all method handles.
-  for (u4 i = 0; i < pDexFile->NumMethodHandles(); ++i) {
-    dumpMethodHandle(pDexFile, i);
+  for (u4 j = 0; j < pDexFile->NumMethodHandles(); ++j) {
+    dumpMethodHandle(pDexFile, j);
   }  // for
 
   // Iterate over all call site ids.
-  for (u4 i = 0; i < pDexFile->NumCallSiteIds(); ++i) {
-    dumpCallSite(pDexFile, i);
+  for (u4 j = 0; j < pDexFile->NumCallSiteIds(); ++j) {
+    dumpCallSite(pDexFile, j);
   }  // for
 
   // Free the last package allocated.
@@ -1893,6 +1845,7 @@ int processFile(const char* fileName) {
     return -1;
   }
   const DexFileLoader dex_file_loader;
+  DexFileLoaderErrorCode error_code;
   std::string error_msg;
   std::vector<std::unique_ptr<const DexFile>> dex_files;
   if (!dex_file_loader.OpenAll(reinterpret_cast<const uint8_t*>(content.data()),
@@ -1900,6 +1853,7 @@ int processFile(const char* fileName) {
                                fileName,
                                kVerify,
                                kVerifyChecksum,
+                               &error_code,
                                &error_msg,
                                &dex_files)) {
     // Display returned error message to user. Note that this error behavior

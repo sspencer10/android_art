@@ -20,7 +20,7 @@
 
 #include "base/mutex.h"
 #include "dex/dex_file-inl.h"
-#include "jni_internal.h"
+#include "jni/jni_internal.h"
 #include "mirror/class-inl.h"
 #include "nth_caller_visitor.h"
 #include "oat_file.h"
@@ -77,7 +77,7 @@ struct MethodIsInterpretedVisitor : public StackVisitor {
         prev_was_runtime_(true),
         require_deoptable_(require_deoptable) {}
 
-  virtual bool VisitFrame() OVERRIDE REQUIRES_SHARED(Locks::mutator_lock_) {
+  bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
     if (goal_ == GetMethod()) {
       method_is_interpreted_ = (require_deoptable_ && prev_was_runtime_) || IsShadowFrame();
       method_found_ = true;
@@ -194,6 +194,26 @@ extern "C" JNIEXPORT void JNICALL Java_Main_assertCallerIsManaged(JNIEnv* env, j
   if (asserts_enabled) {
     CHECK(Java_Main_isCallerManaged(env, cls));
   }
+}
+
+struct GetCallingFrameVisitor : public StackVisitor {
+  GetCallingFrameVisitor(Thread* thread, Context* context)
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      : StackVisitor(thread, context, StackVisitor::StackWalkKind::kIncludeInlinedFrames) {}
+
+  bool VisitFrame() override NO_THREAD_SAFETY_ANALYSIS {
+    // Discard stubs and Main.getThisOfCaller.
+    return GetMethod() == nullptr || GetMethod()->IsNative();
+  }
+};
+
+extern "C" JNIEXPORT jobject JNICALL Java_Main_getThisOfCaller(
+    JNIEnv* env, jclass cls ATTRIBUTE_UNUSED) {
+  ScopedObjectAccess soa(env);
+  std::unique_ptr<art::Context> context(art::Context::Create());
+  GetCallingFrameVisitor visitor(soa.Self(), context.get());
+  visitor.WalkStack();
+  return soa.AddLocalReference<jobject>(visitor.GetThisObject());
 }
 
 }  // namespace art

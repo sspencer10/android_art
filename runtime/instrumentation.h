@@ -37,6 +37,7 @@ class Throwable;
 class ArtField;
 class ArtMethod;
 template <typename T> class Handle;
+template <typename T> class MutableHandle;
 union JValue;
 class ShadowFrame;
 class Thread;
@@ -142,20 +143,31 @@ struct InstrumentationListener {
                       int32_t dex_pc_offset)
       REQUIRES_SHARED(Locks::mutator_lock_) = 0;
 
-  // Call-back for when we get an invokevirtual or an invokeinterface.
-  virtual void InvokeVirtualOrInterface(Thread* thread,
-                                        Handle<mirror::Object> this_object,
-                                        ArtMethod* caller,
-                                        uint32_t dex_pc,
-                                        ArtMethod* callee)
-      REQUIRES_SHARED(Locks::mutator_lock_) = 0;
-
   // Call-back when a shadow_frame with the needs_notify_pop_ boolean set is popped off the stack by
   // either return or exceptions. Normally instrumentation listeners should ensure that there are
   // shadow-frames by deoptimizing stacks.
   virtual void WatchedFramePop(Thread* thread ATTRIBUTE_UNUSED,
                                const ShadowFrame& frame ATTRIBUTE_UNUSED)
       REQUIRES_SHARED(Locks::mutator_lock_) = 0;
+};
+
+class Instrumentation;
+// A helper to send instrumentation events while popping the stack in a safe way.
+class InstrumentationStackPopper {
+ public:
+  explicit InstrumentationStackPopper(Thread* self);
+  ~InstrumentationStackPopper() REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Increase the number of frames being popped to 'desired_pops' return true if the frames were
+  // popped without any exceptions, false otherwise. The exception that caused the pop is
+  // 'exception'.
+  bool PopFramesTo(uint32_t desired_pops, /*in-out*/MutableHandle<mirror::Throwable>& exception)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+ private:
+  Thread* self_;
+  Instrumentation* instrumentation_;
+  uint32_t frames_to_remove_;
 };
 
 // Instrumentation is a catch-all for when extra information is required from the runtime. The
@@ -173,7 +185,6 @@ class Instrumentation {
     kFieldWritten = 0x20,
     kExceptionThrown = 0x40,
     kBranch = 0x80,
-    kInvokeVirtualOrInterface = 0x100,
     kWatchedFramePop = 0x200,
     kExceptionHandled = 0x400,
   };
@@ -292,6 +303,10 @@ class Instrumentation {
   void UpdateMethodsCodeForJavaDebuggable(ArtMethod* method, const void* quick_code)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!deoptimized_methods_lock_);
 
+  // Return the code that we can execute for an invoke including from the JIT.
+  const void* GetCodeForInvoke(ArtMethod* method) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   // Get the quick code for the given method. More efficient than asking the class linker as it
   // will short-cut to GetCode if instrumentation and static method resolution stubs aren't
   // installed.
@@ -353,10 +368,6 @@ class Instrumentation {
     return have_branch_listeners_;
   }
 
-  bool HasInvokeVirtualOrInterfaceListeners() const REQUIRES_SHARED(Locks::mutator_lock_) {
-    return have_invoke_virtual_or_interface_listeners_;
-  }
-
   bool HasWatchedFramePopListeners() const REQUIRES_SHARED(Locks::mutator_lock_) {
     return have_watched_frame_pop_listeners_;
   }
@@ -367,15 +378,6 @@ class Instrumentation {
 
   bool IsActive() const REQUIRES_SHARED(Locks::mutator_lock_) {
     return have_dex_pc_listeners_ || have_method_entry_listeners_ || have_method_exit_listeners_ ||
-        have_field_read_listeners_ || have_field_write_listeners_ ||
-        have_exception_thrown_listeners_ || have_method_unwind_listeners_ ||
-        have_branch_listeners_ || have_invoke_virtual_or_interface_listeners_ ||
-        have_watched_frame_pop_listeners_ || have_exception_handled_listeners_;
-  }
-
-  // Any instrumentation *other* than what is needed for Jit profiling active?
-  bool NonJitProfilingActive() const REQUIRES_SHARED(Locks::mutator_lock_) {
-    return have_dex_pc_listeners_ || have_method_exit_listeners_ ||
         have_field_read_listeners_ || have_field_write_listeners_ ||
         have_exception_thrown_listeners_ || have_method_unwind_listeners_ ||
         have_branch_listeners_ || have_watched_frame_pop_listeners_ ||
@@ -446,17 +448,6 @@ class Instrumentation {
     }
   }
 
-  void InvokeVirtualOrInterface(Thread* thread,
-                                mirror::Object* this_object,
-                                ArtMethod* caller,
-                                uint32_t dex_pc,
-                                ArtMethod* callee) const
-      REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (UNLIKELY(HasInvokeVirtualOrInterfaceListeners())) {
-      InvokeVirtualOrInterfaceImpl(thread, this_object, caller, dex_pc, callee);
-    }
-  }
-
   // Inform listeners that a branch has been taken (only supported by the interpreter).
   void WatchedFramePopped(Thread* thread, const ShadowFrame& frame) const
       REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -494,9 +485,9 @@ class Instrumentation {
                                              uint64_t* gpr_result, uint64_t* fpr_result)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!deoptimized_methods_lock_);
 
-  // Pops an instrumentation frame from the current thread and generate an unwind event.
-  // Returns the return pc for the instrumentation frame that's popped.
-  uintptr_t PopMethodForUnwind(Thread* self, bool is_deoptimization) const
+  // Pops nframes instrumentation frames from the current thread. Returns the return pc for the last
+  // instrumentation frame that's popped.
+  uintptr_t PopFramesForDeoptimization(Thread* self, size_t nframes) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Call back for configure stubs.
@@ -573,12 +564,6 @@ class Instrumentation {
                            uint32_t dex_pc) const
       REQUIRES_SHARED(Locks::mutator_lock_);
   void BranchImpl(Thread* thread, ArtMethod* method, uint32_t dex_pc, int32_t offset) const
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  void InvokeVirtualOrInterfaceImpl(Thread* thread,
-                                    ObjPtr<mirror::Object> this_object,
-                                    ArtMethod* caller,
-                                    uint32_t dex_pc,
-                                    ArtMethod* callee) const
       REQUIRES_SHARED(Locks::mutator_lock_);
   void WatchedFramePopImpl(Thread* thread, const ShadowFrame& frame) const
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -659,9 +644,6 @@ class Instrumentation {
   // Do we have any branch listeners? Short-cut to avoid taking the instrumentation_lock_.
   bool have_branch_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
-  // Do we have any invoke listeners? Short-cut to avoid taking the instrumentation_lock_.
-  bool have_invoke_virtual_or_interface_listeners_ GUARDED_BY(Locks::mutator_lock_);
-
   // Do we have any exception handled listeners? Short-cut to avoid taking the
   // instrumentation_lock_.
   bool have_exception_handled_listeners_ GUARDED_BY(Locks::mutator_lock_);
@@ -685,8 +667,6 @@ class Instrumentation {
   std::list<InstrumentationListener*> method_exit_listeners_ GUARDED_BY(Locks::mutator_lock_);
   std::list<InstrumentationListener*> method_unwind_listeners_ GUARDED_BY(Locks::mutator_lock_);
   std::list<InstrumentationListener*> branch_listeners_ GUARDED_BY(Locks::mutator_lock_);
-  std::list<InstrumentationListener*> invoke_virtual_or_interface_listeners_
-      GUARDED_BY(Locks::mutator_lock_);
   std::list<InstrumentationListener*> dex_pc_listeners_ GUARDED_BY(Locks::mutator_lock_);
   std::list<InstrumentationListener*> field_read_listeners_ GUARDED_BY(Locks::mutator_lock_);
   std::list<InstrumentationListener*> field_write_listeners_ GUARDED_BY(Locks::mutator_lock_);
@@ -696,7 +676,7 @@ class Instrumentation {
 
   // The set of methods being deoptimized (by the debugger) which must be executed with interpreter
   // only.
-  mutable ReaderWriterMutex deoptimized_methods_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
+  mutable ReaderWriterMutex deoptimized_methods_lock_ BOTTOM_MUTEX_ACQUIRED_AFTER;
   std::unordered_set<ArtMethod*> deoptimized_methods_ GUARDED_BY(deoptimized_methods_lock_);
   bool deoptimization_enabled_;
 
@@ -713,6 +693,7 @@ class Instrumentation {
   bool alloc_entrypoints_instrumented_;
 
   friend class InstrumentationTest;  // For GetCurrentInstrumentationLevel and ConfigureStubs.
+  friend class InstrumentationStackPopper;  // For popping instrumentation frames.
 
   DISALLOW_COPY_AND_ASSIGN(Instrumentation);
 };

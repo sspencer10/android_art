@@ -16,6 +16,7 @@
 
 #include "parsed_options.h"
 
+#include <memory>
 #include <sstream>
 
 #include <android-base/logging.h>
@@ -67,7 +68,7 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
   using M = RuntimeArgumentMap;
 
   std::unique_ptr<RuntimeParser::Builder> parser_builder =
-      std::unique_ptr<RuntimeParser::Builder>(new RuntimeParser::Builder());
+      std::make_unique<RuntimeParser::Builder>();
 
   parser_builder->
        Define("-Xzygote")
@@ -194,6 +195,9 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
       .Define("-Xjittransitionweight:_")
           .WithType<unsigned int>()
           .IntoKey(M::JITInvokeTransitionWeight)
+      .Define("-Xjitpthreadpriority:_")
+          .WithType<int>()
+          .IntoKey(M::JITPoolThreadPthreadPriority)
       .Define("-Xjitsaveprofilinginfo")
           .WithType<ProfileSaverOptions>()
           .AppendValues()
@@ -217,9 +221,6 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
       .Define({"-Xrelocate", "-Xnorelocate"})
           .WithValues({true, false})
           .IntoKey(M::Relocate)
-      .Define({"-Xdex2oat", "-Xnodex2oat"})
-          .WithValues({true, false})
-          .IntoKey(M::Dex2Oat)
       .Define({"-Ximage-dex2oat", "-Xnoimage-dex2oat"})
           .WithValues({true, false})
           .IntoKey(M::ImageDex2Oat)
@@ -252,12 +253,6 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
       .Define("-Xstackdumplockprofthreshold:_")
           .WithType<unsigned int>()
           .IntoKey(M::StackDumpLockProfThreshold)
-      .Define("-Xusetombstonedtraces")
-          .WithValue(true)
-          .IntoKey(M::UseTombstonedTraces)
-      .Define("-Xstacktracefile:_")
-          .WithType<std::string>()
-          .IntoKey(M::StackTraceFile)
       .Define("-Xmethod-trace")
           .IntoKey(M::MethodTrace)
       .Define("-Xmethod-trace-file:_")
@@ -336,6 +331,9 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           .IntoKey(M::UseStderrLogger)
       .Define("-Xonly-use-system-oat-files")
           .IntoKey(M::OnlyUseSystemOatFiles)
+      .Define("-Xverifier-logging-threshold=_")
+          .WithType<unsigned int>()
+          .IntoKey(M::VerifierLoggingThreshold)
       .Ignore({
           "-ea", "-da", "-enableassertions", "-disableassertions", "--runtime-arg", "-esa",
           "-dsa", "-enablesystemassertions", "-disablesystemassertions", "-Xrs", "-Xint:_",
@@ -349,7 +347,7 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
 
   // TODO: Move Usage information into this DSL.
 
-  return std::unique_ptr<RuntimeParser>(new RuntimeParser(parser_builder->Build()));
+  return std::make_unique<RuntimeParser>(parser_builder->Build());
 }
 
 #pragma GCC diagnostic pop
@@ -518,9 +516,12 @@ bool ParsedOptions::DoParse(const RuntimeOptions& options,
     LOG(INFO) << "setting boot class path to " << *args.Get(M::BootClassPath);
   }
 
-  if (args.GetOrDefault(M::UseJitCompilation) && args.GetOrDefault(M::Interpret)) {
-    Usage("-Xusejit:true and -Xint cannot be specified together");
-    Exit(0);
+  if (args.GetOrDefault(M::Interpret)) {
+    if (args.Exists(M::UseJitCompilation) && *args.Get(M::UseJitCompilation)) {
+      Usage("-Xusejit:true and -Xint cannot be specified together\n");
+      Exit(0);
+    }
+    args.Set(M::UseJitCompilation, false);
   }
 
   // Set a default boot class path if we didn't get an explicit one via command line.
@@ -699,7 +700,6 @@ void ParsedOptions::Usage(const char* fmt, ...) {
   UsageMessage(stream, "The following Dalvik options are supported:\n");
   UsageMessage(stream, "  -Xzygote\n");
   UsageMessage(stream, "  -Xjnitrace:substring (eg NativeClass or nativeMethod)\n");
-  UsageMessage(stream, "  -Xstacktracefile:<filename>\n");
   UsageMessage(stream, "  -Xgc:[no]preverify\n");
   UsageMessage(stream, "  -Xgc:[no]postverify\n");
   UsageMessage(stream, "  -XX:HeapGrowthLimit=N\n");
@@ -752,7 +752,7 @@ void ParsedOptions::Usage(const char* fmt, ...) {
   UsageMessage(stream, "  -Xcompiler:filename\n");
   UsageMessage(stream, "  -Xcompiler-option dex2oat-option\n");
   UsageMessage(stream, "  -Ximage-compiler-option dex2oat-option\n");
-  UsageMessage(stream, "  -Xpatchoat:filename\n");
+  UsageMessage(stream, "  -Xpatchoat:filename (obsolete, ignored)\n");
   UsageMessage(stream, "  -Xusejit:booleanvalue\n");
   UsageMessage(stream, "  -Xjitinitialsize:N\n");
   UsageMessage(stream, "  -Xjitmaxsize:N\n");

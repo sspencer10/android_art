@@ -28,6 +28,7 @@
 #include "base/stl_util.h"
 #include "base/unix_file/fd_file.h"
 #include "dex/art_dex_file_loader.h"
+#include "dex/class_accessor-inl.h"
 #include "dex/dex_file.h"
 #include "dex/dex_file_loader.h"
 #include "dex/hidden_api_access_flags.h"
@@ -143,23 +144,24 @@ std::unique_ptr<VdexFile> VdexFile::OpenAtAddress(uint8_t* mmap_addr,
     mmap_reuse = false;
   }
   CHECK(!mmap_reuse || mmap_addr != nullptr);
-  std::unique_ptr<MemMap> mmap(MemMap::MapFileAtAddress(
+  MemMap mmap = MemMap::MapFileAtAddress(
       mmap_addr,
       vdex_length,
       (writable || unquicken) ? PROT_READ | PROT_WRITE : PROT_READ,
       unquicken ? MAP_PRIVATE : MAP_SHARED,
       file_fd,
-      0 /* start offset */,
+      /* start= */ 0u,
       low_4gb,
-      mmap_reuse,
       vdex_filename.c_str(),
-      error_msg));
-  if (mmap == nullptr) {
+      mmap_reuse,
+      /* reservation= */ nullptr,
+      error_msg);
+  if (!mmap.IsValid()) {
     *error_msg = "Failed to mmap file " + vdex_filename + " : " + *error_msg;
     return nullptr;
   }
 
-  std::unique_ptr<VdexFile> vdex(new VdexFile(mmap.release()));
+  std::unique_ptr<VdexFile> vdex(new VdexFile(std::move(mmap)));
   if (!vdex->IsValid()) {
     *error_msg = "Vdex file is not valid";
     return nullptr;
@@ -171,10 +173,10 @@ std::unique_ptr<VdexFile> VdexFile::OpenAtAddress(uint8_t* mmap_addr,
       return nullptr;
     }
     vdex->Unquicken(MakeNonOwningPointerVector(unique_ptr_dex_files),
-                    /* decompile_return_instruction */ false);
+                    /* decompile_return_instruction= */ false);
     // Update the quickening info size to pretend there isn't any.
     size_t offset = vdex->GetDexSectionHeaderOffset();
-    reinterpret_cast<DexSectionHeader*>(vdex->mmap_->Begin() + offset)->quickening_info_size_ = 0;
+    reinterpret_cast<DexSectionHeader*>(vdex->mmap_.Begin() + offset)->quickening_info_size_ = 0;
   }
 
   *error_msg = "Success";
@@ -211,13 +213,13 @@ bool VdexFile::OpenAllDexFiles(std::vector<std::unique_ptr<const DexFile>>* dex_
     std::unique_ptr<const DexFile> dex(dex_file_loader.OpenWithDataSection(
         dex_file_start,
         size,
-        /*data_base*/ nullptr,
-        /*data_size*/ 0u,
+        /*data_base=*/ nullptr,
+        /*data_size=*/ 0u,
         location,
         GetLocationChecksum(i),
-        nullptr /*oat_dex_file*/,
-        false /*verify*/,
-        false /*verify_checksum*/,
+        /*oat_dex_file=*/ nullptr,
+        /*verify=*/ false,
+        /*verify_checksum=*/ false,
         error_msg));
     if (dex == nullptr) {
       return false;
@@ -283,29 +285,20 @@ void VdexFile::UnquickenDexFile(const DexFile& target_dex_file,
   std::unordered_set<const DexFile::CodeItem*> unquickened_code_item;
   CompactOffsetTable::Accessor accessor(GetQuickenInfoOffsetTable(source_dex_begin,
                                                                   quickening_info));
-  for (uint32_t i = 0; i < target_dex_file.NumClassDefs(); ++i) {
-    const DexFile::ClassDef& class_def = target_dex_file.GetClassDef(i);
-    const uint8_t* class_data = target_dex_file.GetClassData(class_def);
-    if (class_data != nullptr) {
-      for (ClassDataItemIterator class_it(target_dex_file, class_data);
-           class_it.HasNext();
-           class_it.Next()) {
-        if (class_it.IsAtMethod()) {
-          const DexFile::CodeItem* code_item = class_it.GetMethodCodeItem();
-          if (code_item != nullptr && unquickened_code_item.emplace(code_item).second) {
-            const uint32_t offset = accessor.GetOffset(class_it.GetMemberIndex());
-            // Offset being 0 means not quickened.
-            if (offset != 0u) {
-              ArrayRef<const uint8_t> quicken_data = GetQuickeningInfoAt(quickening_info, offset);
-              optimizer::ArtDecompileDEX(
-                  target_dex_file,
-                  *code_item,
-                  quicken_data,
-                  decompile_return_instruction);
-            }
-          }
+  for (ClassAccessor class_accessor : target_dex_file.GetClasses()) {
+    for (const ClassAccessor::Method& method : class_accessor.GetMethods()) {
+      const DexFile::CodeItem* code_item = method.GetCodeItem();
+      if (code_item != nullptr && unquickened_code_item.emplace(code_item).second) {
+        const uint32_t offset = accessor.GetOffset(method.GetIndex());
+        // Offset being 0 means not quickened.
+        if (offset != 0u) {
+          ArrayRef<const uint8_t> quicken_data = GetQuickeningInfoAt(quickening_info, offset);
+          optimizer::ArtDecompileDEX(
+              target_dex_file,
+              *code_item,
+              quicken_data,
+              decompile_return_instruction);
         }
-        DexFile::UnHideAccessFlags(class_it);
       }
     }
   }

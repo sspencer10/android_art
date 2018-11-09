@@ -91,7 +91,7 @@ BINARY_II_INTRINSIC(MterpIntegerRotateLeft, (Rot<int32_t, true>), SetI);
 // java.lang.Integer.signum(I)I
 UNARY_INTRINSIC(MterpIntegerSignum, Signum, GetVReg, SetI);
 
-// java.lang.Long.reverse(I)I
+// java.lang.Long.reverse(J)J
 UNARY_INTRINSIC(MterpLongReverse, ReverseBits64, GetVRegLong, SetJ);
 
 // java.lang.Long.reverseBytes(J)J
@@ -116,10 +116,10 @@ UNARY_INTRINSIC(MterpLongNumberOfLeadingZeros, JAVASTYLE_CLZ, GetVRegLong, SetJ)
 UNARY_INTRINSIC(MterpLongNumberOfTrailingZeros, JAVASTYLE_CTZ, GetVRegLong, SetJ);
 
 // java.lang.Long.rotateRight(JI)J
-BINARY_JJ_INTRINSIC(MterpLongRotateRight, (Rot<int64_t, false>), SetJ);
+BINARY_JI_INTRINSIC(MterpLongRotateRight, (Rot<int64_t, false>), SetJ);
 
 // java.lang.Long.rotateLeft(JI)J
-BINARY_JJ_INTRINSIC(MterpLongRotateLeft, (Rot<int64_t, true>), SetJ);
+BINARY_JI_INTRINSIC(MterpLongRotateLeft, (Rot<int64_t, true>), SetJ);
 
 // java.lang.Long.signum(J)I
 UNARY_INTRINSIC(MterpLongSignum, Signum, GetVRegLong, SetI);
@@ -558,6 +558,7 @@ bool MterpHandleIntrinsic(ShadowFrame* shadow_frame,
     UNIMPLEMENTED_CASE(ReferenceGetReferent /* ()Ljava/lang/Object; */)
     UNIMPLEMENTED_CASE(IntegerValueOf /* (I)Ljava/lang/Integer; */)
     UNIMPLEMENTED_CASE(ThreadInterrupted /* ()Z */)
+    UNIMPLEMENTED_CASE(CRC32Update /* (II)I */)
     INTRINSIC_CASE(VarHandleFullFence)
     INTRINSIC_CASE(VarHandleAcquireFence)
     INTRINSIC_CASE(VarHandleReleaseFence)

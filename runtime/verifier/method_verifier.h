@@ -96,10 +96,11 @@ class MethodVerifier {
  public:
   // Verify a class. Returns "kNoFailure" on success.
   static FailureKind VerifyClass(Thread* self,
-                                 mirror::Class* klass,
+                                 ObjPtr<mirror::Class> klass,
                                  CompilerCallbacks* callbacks,
                                  bool allow_soft_failures,
                                  HardFailLogMode log_level,
+                                 uint32_t api_level,
                                  std::string* error)
       REQUIRES_SHARED(Locks::mutator_lock_);
   static FailureKind VerifyClass(Thread* self,
@@ -110,6 +111,7 @@ class MethodVerifier {
                                  CompilerCallbacks* callbacks,
                                  bool allow_soft_failures,
                                  HardFailLogMode log_level,
+                                 uint32_t api_level,
                                  std::string* error)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -121,7 +123,8 @@ class MethodVerifier {
                                              Handle<mirror::ClassLoader> class_loader,
                                              const DexFile::ClassDef& class_def,
                                              const DexFile::CodeItem* code_item, ArtMethod* method,
-                                             uint32_t method_access_flags)
+                                             uint32_t method_access_flags,
+                                             uint32_t api_level)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   uint8_t EncodePcToReferenceMapData() const;
@@ -163,8 +166,10 @@ class MethodVerifier {
   // Fills 'monitor_enter_dex_pcs' with the dex pcs of the monitor-enter instructions corresponding
   // to the locks held at 'dex_pc' in method 'm'.
   // Note: this is the only situation where the verifier will visit quickened instructions.
-  static void FindLocksAtDexPc(ArtMethod* m, uint32_t dex_pc,
-                               std::vector<DexLockInfo>* monitor_enter_dex_pcs)
+  static void FindLocksAtDexPc(ArtMethod* m,
+                               uint32_t dex_pc,
+                               std::vector<DexLockInfo>* monitor_enter_dex_pcs,
+                               uint32_t api_level)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   static void Init() REQUIRES_SHARED(Locks::mutator_lock_);
@@ -242,7 +247,8 @@ class MethodVerifier {
                  bool allow_soft_failures,
                  bool need_precise_constants,
                  bool verify_to_dump,
-                 bool allow_thread_suspension)
+                 bool allow_thread_suspension,
+                 uint32_t api_level)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   void UninstantiableError(const char* descriptor);
@@ -275,23 +281,6 @@ class MethodVerifier {
     void Merge(const FailureData& src);
   };
 
-  // Verify all direct or virtual methods of a class. The method assumes that the iterator is
-  // positioned correctly, and the iterator will be updated.
-  template <bool kDirect>
-  static FailureData VerifyMethods(Thread* self,
-                                   ClassLinker* linker,
-                                   const DexFile* dex_file,
-                                   const DexFile::ClassDef& class_def,
-                                   ClassDataItemIterator* it,
-                                   Handle<mirror::DexCache> dex_cache,
-                                   Handle<mirror::ClassLoader> class_loader,
-                                   CompilerCallbacks* callbacks,
-                                   bool allow_soft_failures,
-                                   HardFailLogMode log_level,
-                                   bool need_precise_constants,
-                                   std::string* error_string)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
   /*
    * Perform verification on a single method.
    *
@@ -316,6 +305,7 @@ class MethodVerifier {
                                   bool allow_soft_failures,
                                   HardFailLogMode log_level,
                                   bool need_precise_constants,
+                                  uint32_t api_level,
                                   std::string* hard_failure_msg)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -691,7 +681,7 @@ class MethodVerifier {
   // non-precise reference will be returned.
   // Note: we reuse NO_CLASS as this will throw an exception at runtime, when the failing class is
   //       actually touched.
-  const RegType& FromClass(const char* descriptor, mirror::Class* klass, bool precise)
+  const RegType& FromClass(const char* descriptor, ObjPtr<mirror::Class> klass, bool precise)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   ALWAYS_INLINE bool FailOrAbort(bool condition, const char* error_msg, uint32_t work_insn_idx);
@@ -806,6 +796,10 @@ class MethodVerifier {
 
   // Link, for the method verifier root linked list.
   MethodVerifier* link_;
+
+  // API level, for dependent checks. Note: we do not use '0' for unset here, to simplify checks.
+  // Instead, unset level should correspond to max().
+  const uint32_t api_level_;
 
   friend class art::Thread;
   friend class VerifierDepsTest;

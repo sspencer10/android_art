@@ -33,26 +33,32 @@ class DexFile;
  */
 class HiddenApi {
  public:
-  HiddenApi(const char* blacklist, const char* dark_greylist, const char* light_greylist) {
+  HiddenApi(const char* whitelist,
+            const char* blacklist,
+            const char* dark_greylist,
+            const char* light_greylist) {
     FillList(light_greylist, light_greylist_);
     FillList(dark_greylist, dark_greylist_);
     FillList(blacklist, blacklist_);
+    FillList(whitelist, whitelist_);
   }
 
-  HiddenApiAccessFlags::ApiList GetApiList(const std::string& name) const {
+  hiddenapi::ApiList GetApiList(const std::string& name) const {
     if (IsInList(name, blacklist_)) {
-      return HiddenApiAccessFlags::kBlacklist;
+      return hiddenapi::ApiList::kBlacklist;
     } else if (IsInList(name, dark_greylist_)) {
-      return HiddenApiAccessFlags::kDarkGreylist;
+      return hiddenapi::ApiList::kDarkGreylist;
     } else if (IsInList(name, light_greylist_)) {
-      return HiddenApiAccessFlags::kLightGreylist;
+      return hiddenapi::ApiList::kLightGreylist;
+    } else if (IsInList(name, whitelist_)) {
+      return hiddenapi::ApiList::kWhitelist;
     } else {
-      return HiddenApiAccessFlags::kWhitelist;
+      return hiddenapi::ApiList::kNoList;
     }
   }
 
-  bool IsInRestrictionList(const std::string& name) const {
-    return GetApiList(name) != HiddenApiAccessFlags::kWhitelist;
+  bool IsInAnyList(const std::string& name) const {
+    return GetApiList(name) != hiddenapi::ApiList::kNoList;
   }
 
   static std::string GetApiMethodName(const DexFile& dex_file, uint32_t method_index);
@@ -76,6 +82,7 @@ class HiddenApi {
 
   static void FillList(const char* filename, std::set<std::string>& entries);
 
+  std::set<std::string> whitelist_;
   std::set<std::string> blacklist_;
   std::set<std::string> light_greylist_;
   std::set<std::string> dark_greylist_;
@@ -85,7 +92,7 @@ struct HiddenApiStats {
   uint32_t count = 0;
   uint32_t reflection_count = 0;
   uint32_t linking_count = 0;
-  uint32_t api_counts[4] = { 0, 0, 0, 0 };
+  uint32_t api_counts[5] = { 0, 0, 0, 0, 0 };
 };
 
 }  // namespace art

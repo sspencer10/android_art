@@ -19,8 +19,8 @@
 #include "android-base/stringprintf.h"
 
 #include "art_field-inl.h"
+#include "base/mem_map.h"
 #include "dex/dex_file-inl.h"
-#include "mem_map.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array.h"
@@ -49,21 +49,22 @@ size_t SpaceBitmap<kAlignment>::ComputeHeapSize(uint64_t bitmap_bytes) {
 
 template<size_t kAlignment>
 SpaceBitmap<kAlignment>* SpaceBitmap<kAlignment>::CreateFromMemMap(
-    const std::string& name, MemMap* mem_map, uint8_t* heap_begin, size_t heap_capacity) {
-  CHECK(mem_map != nullptr);
-  uintptr_t* bitmap_begin = reinterpret_cast<uintptr_t*>(mem_map->Begin());
+    const std::string& name, MemMap&& mem_map, uint8_t* heap_begin, size_t heap_capacity) {
+  CHECK(mem_map.IsValid());
+  uintptr_t* bitmap_begin = reinterpret_cast<uintptr_t*>(mem_map.Begin());
   const size_t bitmap_size = ComputeBitmapSize(heap_capacity);
-  return new SpaceBitmap(name, mem_map, bitmap_begin, bitmap_size, heap_begin, heap_capacity);
+  return new SpaceBitmap(
+      name, std::move(mem_map), bitmap_begin, bitmap_size, heap_begin, heap_capacity);
 }
 
 template<size_t kAlignment>
 SpaceBitmap<kAlignment>::SpaceBitmap(const std::string& name,
-                                     MemMap* mem_map,
+                                     MemMap&& mem_map,
                                      uintptr_t* bitmap_begin,
                                      size_t bitmap_size,
                                      const void* heap_begin,
                                      size_t heap_capacity)
-    : mem_map_(mem_map),
+    : mem_map_(std::move(mem_map)),
       bitmap_begin_(reinterpret_cast<Atomic<uintptr_t>*>(bitmap_begin)),
       bitmap_size_(bitmap_size),
       heap_begin_(reinterpret_cast<uintptr_t>(heap_begin)),
@@ -83,14 +84,16 @@ SpaceBitmap<kAlignment>* SpaceBitmap<kAlignment>::Create(
   // (we represent one word as an `intptr_t`).
   const size_t bitmap_size = ComputeBitmapSize(heap_capacity);
   std::string error_msg;
-  std::unique_ptr<MemMap> mem_map(MemMap::MapAnonymous(name.c_str(), nullptr, bitmap_size,
-                                                       PROT_READ | PROT_WRITE, false, false,
-                                                       &error_msg));
-  if (UNLIKELY(mem_map.get() == nullptr)) {
+  MemMap mem_map = MemMap::MapAnonymous(name.c_str(),
+                                        bitmap_size,
+                                        PROT_READ | PROT_WRITE,
+                                        /*low_4gb=*/ false,
+                                        &error_msg);
+  if (UNLIKELY(!mem_map.IsValid())) {
     LOG(ERROR) << "Failed to allocate bitmap " << name << ": " << error_msg;
     return nullptr;
   }
-  return CreateFromMemMap(name, mem_map.release(), heap_begin, heap_capacity);
+  return CreateFromMemMap(name, std::move(mem_map), heap_begin, heap_capacity);
 }
 
 template<size_t kAlignment>
@@ -114,7 +117,7 @@ std::string SpaceBitmap<kAlignment>::Dump() const {
 template<size_t kAlignment>
 void SpaceBitmap<kAlignment>::Clear() {
   if (bitmap_begin_ != nullptr) {
-    mem_map_->MadviseDontNeedAndZero();
+    mem_map_.MadviseDontNeedAndZero();
   }
 }
 
@@ -145,7 +148,7 @@ void SpaceBitmap<kAlignment>::CopyFrom(SpaceBitmap* source_bitmap) {
   Atomic<uintptr_t>* const src = source_bitmap->Begin();
   Atomic<uintptr_t>* const dest = Begin();
   for (size_t i = 0; i < count; ++i) {
-    dest[i].StoreRelaxed(src[i].LoadRelaxed());
+    dest[i].store(src[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
   }
 }
 
@@ -184,7 +187,8 @@ void SpaceBitmap<kAlignment>::SweepWalk(const SpaceBitmap<kAlignment>& live_bitm
   Atomic<uintptr_t>* live = live_bitmap.bitmap_begin_;
   Atomic<uintptr_t>* mark = mark_bitmap.bitmap_begin_;
   for (size_t i = start; i <= end; i++) {
-    uintptr_t garbage = live[i].LoadRelaxed() & ~mark[i].LoadRelaxed();
+    uintptr_t garbage =
+        live[i].load(std::memory_order_relaxed) & ~mark[i].load(std::memory_order_relaxed);
     if (UNLIKELY(garbage != 0)) {
       uintptr_t ptr_base = IndexToOffset(i) + live_bitmap.heap_begin_;
       do {

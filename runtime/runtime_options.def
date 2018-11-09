@@ -21,7 +21,7 @@
 
 // This file defines the list of keys for RuntimeOptions.
 // These can be used with RuntimeOptions.Get/Set/etc, for example:
-//         RuntimeOptions opt; bool* dex2oat_enabled = opt.Get(RuntimeOptions::Dex2Oat);
+//         RuntimeOptions opt; bool* image_dex2oat_enabled = opt.Get(RuntimeOptions::ImageDex2Oat);
 //
 // Column Descriptions:
 //                   <<Type>>             <<Key Name>>                  <<Default Value>>
@@ -44,7 +44,7 @@ RUNTIME_OPTIONS_KEY (std::string,         Image)
 RUNTIME_OPTIONS_KEY (Unit,                CheckJni)
 RUNTIME_OPTIONS_KEY (Unit,                JniOptsForceCopy)
 RUNTIME_OPTIONS_KEY (std::string,         JdwpOptions, "")
-RUNTIME_OPTIONS_KEY (JdwpProvider,        JdwpProvider,                   JdwpProvider::kNone)
+RUNTIME_OPTIONS_KEY (JdwpProvider,        JdwpProvider,                   JdwpProvider::kUnset)
 RUNTIME_OPTIONS_KEY (MemoryKiB,           MemoryMaximumSize,              gc::Heap::kDefaultMaximumSize)  // -Xmx
 RUNTIME_OPTIONS_KEY (MemoryKiB,           MemoryInitialSize,              gc::Heap::kDefaultInitialSize)  // -Xms
 RUNTIME_OPTIONS_KEY (MemoryKiB,           HeapGrowthLimit)                // Default is 0 for unlimited
@@ -69,7 +69,7 @@ RUNTIME_OPTIONS_KEY (Unit,                IgnoreMaxFootprint)
 RUNTIME_OPTIONS_KEY (Unit,                LowMemoryMode)
 RUNTIME_OPTIONS_KEY (bool,                UseTLAB,                        (kUseTlab || kUseReadBarrier))
 RUNTIME_OPTIONS_KEY (bool,                EnableHSpaceCompactForOOM,      true)
-RUNTIME_OPTIONS_KEY (bool,                UseJitCompilation,              false)
+RUNTIME_OPTIONS_KEY (bool,                UseJitCompilation,              true)
 RUNTIME_OPTIONS_KEY (bool,                DumpNativeStackOnSigQuit,       true)
 RUNTIME_OPTIONS_KEY (bool,                MadviseRandomAccess,            false)
 RUNTIME_OPTIONS_KEY (unsigned int,        JITCompileThreshold)
@@ -77,6 +77,7 @@ RUNTIME_OPTIONS_KEY (unsigned int,        JITWarmupThreshold)
 RUNTIME_OPTIONS_KEY (unsigned int,        JITOsrThreshold)
 RUNTIME_OPTIONS_KEY (unsigned int,        JITPriorityThreadWeight)
 RUNTIME_OPTIONS_KEY (unsigned int,        JITInvokeTransitionWeight)
+RUNTIME_OPTIONS_KEY (int,                 JITPoolThreadPthreadPriority,   jit::kJitPoolThreadPthreadDefaultPriority)
 RUNTIME_OPTIONS_KEY (MemoryKiB,           JITCodeCacheInitialCapacity,    jit::JitCodeCache::kInitialCapacity)
 RUNTIME_OPTIONS_KEY (MemoryKiB,           JITCodeCacheMaxCapacity,        jit::JitCodeCache::kMaxCapacity)
 RUNTIME_OPTIONS_KEY (MillisecondsToNanoseconds, \
@@ -87,7 +88,6 @@ RUNTIME_OPTIONS_KEY (std::vector<std::string>, \
 RUNTIME_OPTIONS_KEY (std::string,         JniTrace)
 RUNTIME_OPTIONS_KEY (std::string,         PatchOat)
 RUNTIME_OPTIONS_KEY (bool,                Relocate,                       kDefaultMustRelocate)
-RUNTIME_OPTIONS_KEY (bool,                Dex2Oat,                        true)
 RUNTIME_OPTIONS_KEY (bool,                ImageDex2Oat,                   true)
 RUNTIME_OPTIONS_KEY (bool,                Interpret,                      false) // -Xint
                                                         // Disable the compiler for CC (for now).
@@ -103,8 +103,6 @@ RUNTIME_OPTIONS_KEY (Unit,                ForceNativeBridge)
 RUNTIME_OPTIONS_KEY (LogVerbosity,        Verbose)
 RUNTIME_OPTIONS_KEY (unsigned int,        LockProfThreshold)
 RUNTIME_OPTIONS_KEY (unsigned int,        StackDumpLockProfThreshold)
-RUNTIME_OPTIONS_KEY (bool,                UseTombstonedTraces, false)
-RUNTIME_OPTIONS_KEY (std::string,         StackTraceFile)
 RUNTIME_OPTIONS_KEY (Unit,                MethodTrace)
 RUNTIME_OPTIONS_KEY (std::string,         MethodTraceFile,                "/data/misc/trace/method-trace-file.bin")
 RUNTIME_OPTIONS_KEY (unsigned int,        MethodTraceFileSize,            10 * MB)
@@ -153,5 +151,6 @@ RUNTIME_OPTIONS_KEY (unsigned int,        GlobalRefAllocStackTraceLimit,  0)  //
 RUNTIME_OPTIONS_KEY (Unit,                UseStderrLogger)
 
 RUNTIME_OPTIONS_KEY (Unit,                OnlyUseSystemOatFiles)
+RUNTIME_OPTIONS_KEY (unsigned int,        VerifierLoggingThreshold,       100)
 
 #undef RUNTIME_OPTIONS_KEY

@@ -43,7 +43,7 @@
 #include "gc/gc_cause.h"
 #include "gc/scoped_gc_critical_section.h"
 #include "gc_root-inl.h"
-#include "jni_internal.h"
+#include "jni/jni_internal.h"
 #include "mirror/class.h"
 #include "mirror/object-inl.h"
 #include "mirror/string.h"
@@ -59,6 +59,8 @@
 #include "well_known_classes.h"
 
 namespace openjdkjvmti {
+
+static const char* kJvmtiTlsKey = "JvmtiTlsKey";
 
 art::ArtField* ThreadUtil::context_class_loader_ = nullptr;
 
@@ -80,7 +82,7 @@ struct ThreadCallback : public art::ThreadLifecycleCallback {
                                          thread.get());
   }
 
-  void ThreadStart(art::Thread* self) OVERRIDE REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  void ThreadStart(art::Thread* self) override REQUIRES_SHARED(art::Locks::mutator_lock_) {
     if (!started) {
       // Runtime isn't started. We only expect at most the signal handler or JIT threads to be
       // started here.
@@ -99,7 +101,7 @@ struct ThreadCallback : public art::ThreadLifecycleCallback {
     Post<ArtJvmtiEvent::kThreadStart>(self);
   }
 
-  void ThreadDeath(art::Thread* self) OVERRIDE REQUIRES_SHARED(art::Locks::mutator_lock_) {
+  void ThreadDeath(art::Thread* self) override REQUIRES_SHARED(art::Locks::mutator_lock_) {
     Post<ArtJvmtiEvent::kThreadEnd>(self);
   }
 
@@ -621,17 +623,10 @@ jvmtiError ThreadUtil::GetAllThreads(jvmtiEnv* env,
   return ERR(NONE);
 }
 
-// The struct that we store in the art::Thread::custom_tls_ that maps the jvmtiEnvs to the data
-// stored with that thread. This is needed since different jvmtiEnvs are not supposed to share TLS
-// data but we only have a single slot in Thread objects to store data.
-struct JvmtiGlobalTLSData {
-  std::unordered_map<jvmtiEnv*, const void*> data GUARDED_BY(art::Locks::thread_list_lock_);
-};
-
 static void RemoveTLSData(art::Thread* target, void* ctx) REQUIRES(art::Locks::thread_list_lock_) {
   jvmtiEnv* env = reinterpret_cast<jvmtiEnv*>(ctx);
   art::Locks::thread_list_lock_->AssertHeld(art::Thread::Current());
-  JvmtiGlobalTLSData* global_tls = reinterpret_cast<JvmtiGlobalTLSData*>(target->GetCustomTLS());
+  JvmtiGlobalTLSData* global_tls = ThreadUtil::GetGlobalTLSData(target);
   if (global_tls != nullptr) {
     global_tls->data.erase(env);
   }
@@ -654,15 +649,25 @@ jvmtiError ThreadUtil::SetThreadLocalStorage(jvmtiEnv* env, jthread thread, cons
     return err;
   }
 
-  JvmtiGlobalTLSData* global_tls = reinterpret_cast<JvmtiGlobalTLSData*>(target->GetCustomTLS());
-  if (global_tls == nullptr) {
-    target->SetCustomTLS(new JvmtiGlobalTLSData);
-    global_tls = reinterpret_cast<JvmtiGlobalTLSData*>(target->GetCustomTLS());
-  }
+  JvmtiGlobalTLSData* global_tls = GetOrCreateGlobalTLSData(target);
 
   global_tls->data[env] = data;
 
   return ERR(NONE);
+}
+
+JvmtiGlobalTLSData* ThreadUtil::GetOrCreateGlobalTLSData(art::Thread* thread) {
+  JvmtiGlobalTLSData* data = GetGlobalTLSData(thread);
+  if (data != nullptr) {
+    return data;
+  } else {
+    thread->SetCustomTLS(kJvmtiTlsKey, new JvmtiGlobalTLSData);
+    return GetGlobalTLSData(thread);
+  }
+}
+
+JvmtiGlobalTLSData* ThreadUtil::GetGlobalTLSData(art::Thread* thread) {
+  return reinterpret_cast<JvmtiGlobalTLSData*>(thread->GetCustomTLS(kJvmtiTlsKey));
 }
 
 jvmtiError ThreadUtil::GetThreadLocalStorage(jvmtiEnv* env,
@@ -681,7 +686,7 @@ jvmtiError ThreadUtil::GetThreadLocalStorage(jvmtiEnv* env,
     return err;
   }
 
-  JvmtiGlobalTLSData* global_tls = reinterpret_cast<JvmtiGlobalTLSData*>(target->GetCustomTLS());
+  JvmtiGlobalTLSData* global_tls = GetGlobalTLSData(target);
   if (global_tls == nullptr) {
     *data_ptr = nullptr;
     return OK;
@@ -807,7 +812,7 @@ jvmtiError ThreadUtil::RunAgentThread(jvmtiEnv* jvmti_env,
     runtime->EndThreadBirth();
     return ERR(INTERNAL);
   }
-  data.release();
+  data.release();  // NOLINT pthreads API.
 
   return ERR(NONE);
 }
@@ -852,7 +857,7 @@ jvmtiError ThreadUtil::SuspendOther(art::Thread* self,
     bool timeout = true;
     art::Thread* ret_target = art::Runtime::Current()->GetThreadList()->SuspendThreadByPeer(
         target_jthread,
-        /* request_suspension */ true,
+        /* request_suspension= */ true,
         art::SuspendReason::kForUserCode,
         &timeout);
     if (ret_target == nullptr && !timeout) {
@@ -1064,7 +1069,7 @@ jvmtiError ThreadUtil::StopThread(jvmtiEnv* env ATTRIBUTE_UNUSED,
    public:
     explicit StopThreadClosure(art::Handle<art::mirror::Throwable> except) : exception_(except) { }
 
-    void Run(art::Thread* me) REQUIRES_SHARED(art::Locks::mutator_lock_) {
+    void Run(art::Thread* me) override REQUIRES_SHARED(art::Locks::mutator_lock_) {
       // Make sure the thread is prepared to notice the exception.
       art::Runtime::Current()->GetInstrumentation()->InstrumentThreadStack(me);
       me->SetAsyncException(exception_.Get());

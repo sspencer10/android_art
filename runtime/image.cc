@@ -26,7 +26,7 @@
 namespace art {
 
 const uint8_t ImageHeader::kImageMagic[] = { 'a', 'r', 't', '\n' };
-const uint8_t ImageHeader::kImageVersion[] = { '0', '5', '6', '\0' };  // ReachabilityFence.
+const uint8_t ImageHeader::kImageVersion[] = { '0', '6', '7', '\0' };  // Added CRC32 intrinsic
 
 ImageHeader::ImageHeader(uint32_t image_begin,
                          uint32_t image_size,
@@ -42,8 +42,6 @@ ImageHeader::ImageHeader(uint32_t image_begin,
                          uint32_t boot_oat_begin,
                          uint32_t boot_oat_size,
                          uint32_t pointer_size,
-                         bool compile_pic,
-                         bool is_pic,
                          StorageMode storage_mode,
                          size_t data_size)
   : image_begin_(image_begin),
@@ -60,8 +58,6 @@ ImageHeader::ImageHeader(uint32_t image_begin,
     patch_delta_(0),
     image_roots_(image_roots),
     pointer_size_(pointer_size),
-    compile_pic_(compile_pic),
-    is_pic_(is_pic),
     storage_mode_(storage_mode),
     data_size_(data_size) {
   CHECK_EQ(image_begin, RoundUp(image_begin, kPageSize));
@@ -77,7 +73,7 @@ ImageHeader::ImageHeader(uint32_t image_begin,
   std::copy_n(sections, kSectionCount, sections_);
 }
 
-void ImageHeader::RelocateImage(off_t delta) {
+void ImageHeader::RelocateImage(int64_t delta) {
   CHECK_ALIGNED(delta, kPageSize) << " patch delta must be page aligned";
   oat_file_begin_ += delta;
   oat_data_begin_ += delta;
@@ -88,12 +84,12 @@ void ImageHeader::RelocateImage(off_t delta) {
   RelocateImageMethods(delta);
 }
 
-void ImageHeader::RelocateImageObjects(off_t delta) {
+void ImageHeader::RelocateImageObjects(int64_t delta) {
   image_begin_ += delta;
   image_roots_ += delta;
 }
 
-void ImageHeader::RelocateImageMethods(off_t delta) {
+void ImageHeader::RelocateImageMethods(int64_t delta) {
   for (size_t i = 0; i < kImageMethodsCount; ++i) {
     image_methods_[i] += delta;
   }
@@ -135,11 +131,6 @@ ArtMethod* ImageHeader::GetImageMethod(ImageMethod index) const {
   return reinterpret_cast<ArtMethod*>(image_methods_[index]);
 }
 
-void ImageHeader::SetImageMethod(ImageMethod index, ArtMethod* method) {
-  CHECK_LT(static_cast<size_t>(index), kImageMethodsCount);
-  image_methods_[index] = reinterpret_cast<uint64_t>(method);
-}
-
 std::ostream& operator<<(std::ostream& os, const ImageSection& section) {
   return os << "size=" << section.Size() << " range=" << section.Offset() << "-" << section.End();
 }
@@ -154,38 +145,6 @@ void ImageHeader::VisitObjects(ObjectVisitor* visitor,
     mirror::Object* object = reinterpret_cast<mirror::Object*>(base + objects.Offset() + pos);
     visitor->Visit(object);
     pos += RoundUp(object->SizeOf(), kObjectAlignment);
-  }
-}
-
-void ImageHeader::VisitPackedArtFields(ArtFieldVisitor* visitor, uint8_t* base) const {
-  const ImageSection& fields = GetFieldsSection();
-  for (size_t pos = 0; pos < fields.Size(); ) {
-    auto* array = reinterpret_cast<LengthPrefixedArray<ArtField>*>(base + fields.Offset() + pos);
-    for (size_t i = 0; i < array->size(); ++i) {
-      visitor->Visit(&array->At(i, sizeof(ArtField)));
-    }
-    pos += array->ComputeSize(array->size());
-  }
-}
-
-void ImageHeader::VisitPackedArtMethods(ArtMethodVisitor* visitor,
-                                        uint8_t* base,
-                                        PointerSize pointer_size) const {
-  const size_t method_alignment = ArtMethod::Alignment(pointer_size);
-  const size_t method_size = ArtMethod::Size(pointer_size);
-  const ImageSection& methods = GetMethodsSection();
-  for (size_t pos = 0; pos < methods.Size(); ) {
-    auto* array = reinterpret_cast<LengthPrefixedArray<ArtMethod>*>(base + methods.Offset() + pos);
-    for (size_t i = 0; i < array->size(); ++i) {
-      visitor->Visit(&array->At(i, method_size, method_alignment));
-    }
-    pos += array->ComputeSize(array->size(), method_size, method_alignment);
-  }
-  const ImageSection& runtime_methods = GetRuntimeMethodsSection();
-  for (size_t pos = 0; pos < runtime_methods.Size(); ) {
-    auto* method = reinterpret_cast<ArtMethod*>(base + runtime_methods.Offset() + pos);
-    visitor->Visit(method);
-    pos += method_size;
   }
 }
 

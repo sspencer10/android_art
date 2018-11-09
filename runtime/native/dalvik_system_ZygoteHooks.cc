@@ -28,9 +28,9 @@
 #include "base/runtime_debug.h"
 #include "debugger.h"
 #include "hidden_api.h"
-#include "java_vm_ext.h"
 #include "jit/jit.h"
-#include "jni_internal.h"
+#include "jni/java_vm_ext.h"
+#include "jni/jni_internal.h"
 #include "native_util.h"
 #include "nativehelper/jni_macros.h"
 #include "nativehelper/scoped_utf_chars.h"
@@ -100,7 +100,7 @@ class ClassSet {
   }
 
   void AddClass(ObjPtr<mirror::Class> klass) REQUIRES(Locks::mutator_lock_) {
-    class_set_.insert(self_->GetJniEnv()->AddLocalReference<jclass>(klass.Ptr()));
+    class_set_.insert(self_->GetJniEnv()->AddLocalReference<jclass>(klass));
   }
 
   const std::unordered_set<jclass>& GetClasses() const {
@@ -120,9 +120,9 @@ static void DoCollectNonDebuggableCallback(Thread* thread, void* data)
         : StackVisitor(t, nullptr, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
           class_set_(class_set) {}
 
-    ~NonDebuggableStacksVisitor() OVERRIDE {}
+    ~NonDebuggableStacksVisitor() override {}
 
-    bool VisitFrame() OVERRIDE REQUIRES(Locks::mutator_lock_) {
+    bool VisitFrame() override REQUIRES(Locks::mutator_lock_) {
       if (GetMethod()->IsRuntimeMethod()) {
         return true;
       }
@@ -152,7 +152,8 @@ static void CollectNonDebuggableClasses() REQUIRES(!Locks::mutator_lock_) {
     // Drop the shared mutator lock.
     ScopedThreadSuspension sts(self, art::ThreadState::kNative);
     // Get exclusive mutator lock with suspend all.
-    ScopedSuspendAll suspend("Checking stacks for non-obsoletable methods!", /*long_suspend*/false);
+    ScopedSuspendAll suspend("Checking stacks for non-obsoletable methods!",
+                             /*long_suspend=*/false);
     MutexLock mu(Thread::Current(), *Locks::thread_list_lock_);
     runtime->GetThreadList()->ForEach(DoCollectNonDebuggableCallback, &classes);
   }
@@ -224,7 +225,9 @@ static uint32_t EnableDebugFeatures(uint32_t runtime_flags) {
   if ((runtime_flags & DEBUG_ALWAYS_JIT) != 0) {
     jit::JitOptions* jit_options = runtime->GetJITOptions();
     CHECK(jit_options != nullptr);
-    jit_options->SetJitAtFirstUse();
+    Runtime::Current()->DoAndMaybeSwitchInterpreter([=]() {
+        jit_options->SetJitAtFirstUse();
+    });
     runtime_flags &= ~DEBUG_ALWAYS_JIT;
   }
 
@@ -279,6 +282,15 @@ static jlong ZygoteHooks_nativePreFork(JNIEnv* env, jclass) {
   return reinterpret_cast<jlong>(ThreadForEnv(env));
 }
 
+static void ZygoteHooks_nativePostForkSystemServer(JNIEnv* env ATTRIBUTE_UNUSED,
+                                                   jclass klass ATTRIBUTE_UNUSED) {
+  // This JIT code cache for system server is created whilst the runtime is still single threaded.
+  // System server has a window where it can create executable pages for this purpose, but this is
+  // turned off after this hook. Consequently, the only JIT mode supported is the dual-view JIT
+  // where one mapping is R->RW and the other is RX. Single view requires RX->RWX->RX.
+  Runtime::Current()->CreateJitCodeCache(/*rwx_memory_allowed=*/false);
+}
+
 static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
                                             jclass,
                                             jlong token,
@@ -316,6 +328,8 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
     LOG(ERROR) << StringPrintf("Unknown bits set in runtime_flags: %#x", runtime_flags);
   }
 
+  Runtime::Current()->GetHeap()->PostForkChildAction(thread);
+
   // Update tracing.
   if (Trace::GetMethodTracingMode() != TracingMode::kTracingInactive) {
     Trace::TraceOutputMode output_mode = Trace::GetOutputMode();
@@ -346,7 +360,6 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
 
       std::string trace_file = StringPrintf("/data/misc/trace/%s.trace.bin", proc_name.c_str());
       Trace::Start(trace_file.c_str(),
-                   -1,
                    buffer_size,
                    0,   // TODO: Expose flags.
                    output_mode,
@@ -398,7 +411,7 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
         env,
         is_system_server,
         Runtime::NativeBridgeAction::kUnload,
-        /*isa*/ nullptr,
+        /*isa=*/ nullptr,
         profile_system_server);
   }
 }
@@ -415,6 +428,7 @@ static void ZygoteHooks_stopZygoteNoThreadCreation(JNIEnv* env ATTRIBUTE_UNUSED,
 
 static JNINativeMethod gMethods[] = {
   NATIVE_METHOD(ZygoteHooks, nativePreFork, "()J"),
+  NATIVE_METHOD(ZygoteHooks, nativePostForkSystemServer, "()V"),
   NATIVE_METHOD(ZygoteHooks, nativePostForkChild, "(JIZZLjava/lang/String;)V"),
   NATIVE_METHOD(ZygoteHooks, startZygoteNoThreadCreation, "()V"),
   NATIVE_METHOD(ZygoteHooks, stopZygoteNoThreadCreation, "()V"),

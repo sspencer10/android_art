@@ -40,7 +40,7 @@ class Object;
 class String;
 }  // namespace mirror
 
-class ArtField FINAL {
+class ArtField final {
  public:
   template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
   ObjPtr<mirror::Class> GetDeclaringClass() REQUIRES_SHARED(Locks::mutator_lock_);
@@ -180,8 +180,8 @@ class ArtField FINAL {
     return (GetAccessFlags() & kAccVolatile) != 0;
   }
 
-  HiddenApiAccessFlags::ApiList GetHiddenApiAccessFlags() REQUIRES_SHARED(Locks::mutator_lock_) {
-    return HiddenApiAccessFlags::DecodeFromRuntime(GetAccessFlags());
+  hiddenapi::ApiList GetHiddenApiAccessFlags() REQUIRES_SHARED(Locks::mutator_lock_) {
+    return hiddenapi::DecodeFromRuntime(GetAccessFlags());
   }
 
   // Returns an instance field with this offset in the given class or null if not found.
@@ -201,8 +201,7 @@ class ArtField FINAL {
   const char* GetName() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Resolves / returns the name from the dex cache.
-  ObjPtr<mirror::String> GetStringName(Thread* self, bool resolve)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  ObjPtr<mirror::String> ResolveNameString() REQUIRES_SHARED(Locks::mutator_lock_);
 
   const char* GetTypeDescriptor() REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -215,6 +214,7 @@ class ArtField FINAL {
 
   size_t FieldSize() REQUIRES_SHARED(Locks::mutator_lock_);
 
+  template <ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
   ObjPtr<mirror::DexCache> GetDexCache() REQUIRES_SHARED(Locks::mutator_lock_);
 
   const DexFile* GetDexFile() REQUIRES_SHARED(Locks::mutator_lock_);
@@ -236,11 +236,9 @@ class ArtField FINAL {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
+  bool IsProxyField() REQUIRES_SHARED(Locks::mutator_lock_);
+
   ObjPtr<mirror::Class> ProxyFindSystemClass(const char* descriptor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  ObjPtr<mirror::String> ResolveGetStringName(Thread* self,
-                                              dex::StringIndex string_idx,
-                                              ObjPtr<mirror::DexCache> dex_cache)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   void GetAccessFlagsDCheck() REQUIRES_SHARED(Locks::mutator_lock_);

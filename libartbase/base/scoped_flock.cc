@@ -22,7 +22,8 @@
 #include <android-base/logging.h>
 #include <android-base/stringprintf.h>
 
-#include "base/unix_file/fd_file.h"
+#include "file_utils.h"
+#include "unix_file/fd_file.h"
 
 namespace art {
 
@@ -40,7 +41,7 @@ using android::base::StringPrintf;
     // to acquire a lock, and the unlock / close in the corresponding
     // destructor. Callers should explicitly flush files they're writing to if
     // that is the desired behaviour.
-    std::unique_ptr<File> file(OS::OpenFileWithFlags(filename, flags, false /* check_usage */));
+    std::unique_ptr<File> file(OS::OpenFileWithFlags(filename, flags, /* auto_flush= */ false));
     if (file.get() == nullptr) {
       *error_msg = StringPrintf("Failed to open file '%s': %s", filename, strerror(errno));
       return nullptr;
@@ -98,7 +99,7 @@ ScopedFlock LockedFile::DupOf(const int fd, const std::string& path,
   // destructor. Callers should explicitly flush files they're writing to if
   // that is the desired behaviour.
   ScopedFlock locked_file(
-      new LockedFile(dup(fd), path, false /* check_usage */, read_only_mode));
+      new LockedFile(DupCloexec(fd), path, /* check_usage= */ false, read_only_mode));
   if (locked_file->Fd() == -1) {
     *error_msg = StringPrintf("Failed to duplicate open file '%s': %s",
                               locked_file->GetPath().c_str(), strerror(errno));
